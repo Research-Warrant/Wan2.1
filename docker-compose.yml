@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  wan-flask-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wan-flask-api
+    volumes:
+      - ./models:/app/models
+      - ./outputs:/app/outputs
+    ports:
+      - "5000:5000"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
