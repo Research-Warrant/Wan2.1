@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+FROM nvidia/cuda:12.3.0-devel-ubuntu22.04
 
 # Set working directory
 WORKDIR /app
@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     tzdata \
     git-lfs \
+    python3 \
+    python3-pip \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Initialize git-lfs
@@ -29,10 +32,11 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 # Copy requirements and install Python dependencies
 COPY requirements-flask.txt .
 
-# Install core dependencies with optimized CUDA packages
-RUN pip3 install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu121 && \
-    pip3 install --no-cache-dir xformers && \
-    pip3 install --no-cache-dir triton
+# Install PyTorch 2.3.0 with CUDA 12.1 support for SM 12.0 architecture (RTX 5080)
+RUN pip3 install --no-cache-dir torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121 && \
+    pip3 install --no-cache-dir xformers==0.0.25 && \
+    pip3 install --no-cache-dir triton && \
+    pip3 install --no-cache-dir flash-attn --no-build-isolation
 
 # Clone and install DiffSynth-Studio
 RUN cd /tmp && \
@@ -52,10 +56,8 @@ RUN cd /tmp && \
     cd /app
 
 # Install Python dependencies with error handling
-RUN pip3 install --no-cache-dir -r requirements-flask.txt || \
-    (echo "Falling back to installation without flash_attn" && \
-     grep -v "flash_attn" requirements-flask.txt > requirements-no-flash.txt && \
-     pip3 install --no-cache-dir -r requirements-no-flash.txt)
+RUN grep -v "flash_attn" requirements-flask.txt > requirements-no-flash.txt && \
+    pip3 install --no-cache-dir -r requirements-no-flash.txt
 
 # Install additional dependencies
 RUN pip install --no-cache-dir moviepy huggingface_hub ipywidgets hf_transfer torchao
