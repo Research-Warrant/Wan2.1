@@ -60,6 +60,7 @@ auto_pre_processed_images
 # Model and weight files
 *.pt
 *.pth
+auto_pre_processed_images
 *.ckpt
 *.safetensors
 *.onnx
@@ -106,6 +107,16 @@ node_modules/
 *.html
 *.pdf
 *.whl
+cache
+DiffSynth-Studio
+outputs
+configs
+venv
+__pycache__/
+storage/
+samples/
+wan_2_1_all_models.z01
+__rzi_23488.17853.rartemp
 *.json
 
 # Global allow
