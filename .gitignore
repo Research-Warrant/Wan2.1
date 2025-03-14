@@ -103,6 +103,7 @@ node_modules/
 
 # Documentation and other files
 *.backup
+models
 *.pkl
 *.html
 *.pdf
