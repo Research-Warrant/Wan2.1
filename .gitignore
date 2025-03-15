@@ -116,6 +116,7 @@ venv
 __pycache__/
 storage/
 samples/
+install
 wan_2_1_all_models.z01
 __rzi_23488.17853.rartemp
 *.json
