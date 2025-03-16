@@ -7,10 +7,11 @@ import time
 import tempfile
 import json
 import gc  # Added for garbage collection
+import re  # Added for prompt processing
 
 import torch
 import gradio as gr
-from PIL import Image
+from PIL import Image, ImageOps  # Modified: Import ImageOps for orientation fix
 import cv2
 
 import wan
@@ -299,7 +300,56 @@ def load_config(selected_config):
     )
 
 # ------------------------------
-# New helper functions
+# New helper functions for prompt processing and auto scale
+# ------------------------------
+
+def process_random_prompt(prompt):
+    """
+    Process all occurrences of <random: X, Y, Z, ...> in the prompt.
+    Each such pattern is replaced by one randomly selected choice.
+    """
+    pattern = r'<random:\s*([^>]+)>'
+    def replacer(match):
+        options = [option.strip() for option in match.group(1).split(',') if option.strip()]
+        if options:
+            return random.choice(options)
+        return ''
+    return re.sub(pattern, replacer, prompt)
+
+def compute_auto_scale_dimensions(image, default_width, default_height):
+    """
+    Compute new dimensions for the image such that the total pixel area is
+    close to default_width x default_height while keeping aspect ratio intact.
+    Both dimensions are made divisible by 16.
+    """
+    target_area = default_width * default_height
+    orig_w, orig_h = image.size
+    if orig_w * orig_h <= target_area:
+        return orig_w, orig_h
+    scale_factor = (target_area / (orig_w * orig_h)) ** 0.5
+    new_w = int(orig_w * scale_factor)
+    new_h = int(orig_h * scale_factor)
+    new_w = (new_w // 16) * 16
+    new_h = (new_h // 16) * 16
+    new_w = max(new_w, 16)
+    new_h = max(new_h, 16)
+    return new_w, new_h
+
+def update_target_dimensions(image, auto_scale, current_width, current_height):
+    """
+    If auto_scale is selected and an image is provided, compute the new width and height.
+    Otherwise, return the current width and height.
+    """
+    if auto_scale and image is not None:
+        try:
+            new_w, new_h = compute_auto_scale_dimensions(image, current_width, current_height)
+            return new_w, new_h
+        except Exception as e:
+            return current_width, current_height
+    return current_width, current_height
+
+# ------------------------------
+# Existing helper functions for images and LoRA
 # ------------------------------
 def auto_crop_image(image, target_width, target_height):
     """
@@ -397,87 +447,170 @@ ASPECT_RATIOS_14b = {
     "5:4":  (1072, 864),
 }
 
-def update_vram_and_resolution(model_choice, preset):
+# Updated function: now takes torch_dtype as an additional parameter
+def update_vram_and_resolution(model_choice, preset, torch_dtype):
     print(model_choice)
-    if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)":
-        mapping = {
-            "4GB": "0",
-            "6GB": "500000000",
-            "8GB": "1000000000",
-            "10GB": "7000000000",
-            "12GB": "7000000000",
-            "16GB": "7000000000",
-            "24GB": "7000000000",
-            "32GB": "7000000000",
-            "48GB": "12000000000",
-            "80GB": "12000000000"
-        }
-        resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
-        default_aspect = "16:9"
-    elif model_choice == "WAN 2.1 14B Text-to-Video":
-        mapping = {
-            "4GB": "0",
-            "6GB": "0",
-            "8GB": "0",
-            "10GB": "0",
-            "12GB": "0",
-            "16GB": "0",
-            "24GB": "3000000000",
-            "32GB": "6500000000",
-            "48GB": "22000000000",
-            "80GB": "70000000000"
-        }
-        resolution_choices = list(ASPECT_RATIOS_14b.keys())
-        default_aspect = "16:9"
-    elif model_choice == "WAN 2.1 14B Image-to-Video 720P":
-        mapping = {
-            "4GB": "0",
-            "6GB": "0",
-            "8GB": "0",
-            "10GB": "0",
-            "12GB": "0",
-            "16GB": "0",
-            "24GB": "0",
-            "32GB": "3500000000",
-            "48GB": "12000000000",
-            "80GB": "70000000000"
-        }
-        resolution_choices = list(ASPECT_RATIOS_14b.keys())
-        default_aspect = "16:9"
-    elif model_choice == "WAN 2.1 14B Image-to-Video 480P":
-        mapping = {
-            "4GB": "0",
-            "6GB": "0",
-            "8GB": "0",
-            "10GB": "0",
-            "12GB": "0",
-            "16GB": "1200000000",
-            "24GB": "5000000000",
-            "32GB": "9500000000",
-            "48GB": "20000000000",
-            "80GB": "70000000000"
-        }
-        resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
-        default_aspect = "16:9"
+    if torch_dtype == "torch.float8_e4m3fn":
+        if model_choice == "WAN 2.1 14B Text-to-Video":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "0",
+                "16GB": "0",
+                "24GB": "8,750,000,000",
+                "32GB": "22,000,000,000",
+                "48GB": "22,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_14b.keys())
+            default_aspect = "16:9"
+        elif model_choice == "WAN 2.1 14B Image-to-Video 720P":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "0",
+                "16GB": "0",
+                "24GB": "6,000,000,000",
+                "32GB": "16,000,000,000",
+                "48GB": "22,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_14b.keys())
+            default_aspect = "16:9"
+        elif model_choice == "WAN 2.1 14B Image-to-Video 480P":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "2,500,000,000",
+                "16GB": "7,500,000,000",
+                "24GB": "15,000,000,000",
+                "32GB": "22,000,000,000",
+                "48GB": "22,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
+            default_aspect = "16:9"
+        else:
+            # For other models, fallback to BF16 mapping
+            if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)":
+                mapping = {
+                    "4GB": "0",
+                    "6GB": "500,000,000",
+                    "8GB": "7,000,000,000",
+                    "10GB": "7,000,000,000",
+                    "12GB": "7,000,000,000",
+                    "16GB": "7,000,000,000",
+                    "24GB": "7,000,000,000",
+                    "32GB": "7,000,000,000",
+                    "48GB": "7,000,000,000",
+                    "80GB": "7,000,000,000"
+                }
+                resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
+                default_aspect = "16:9"
+            else:
+                mapping = {
+                    "4GB": "0",
+                    "6GB": "0",
+                    "8GB": "0",
+                    "10GB": "0",
+                    "12GB": "0",
+                    "16GB": "0",
+                    "24GB": "3,000,000,000",
+                    "32GB": "6,750,000,000",
+                    "48GB": "16,000,000,000",
+                    "80GB": "22,000,000,000"
+                }
+                resolution_choices = list(ASPECT_RATIOS_14b.keys())
+                default_aspect = "16:9"
+        return mapping.get(preset, "12000000000"), resolution_choices, default_aspect
     else:
-        mapping = {
-            "4GB": "0",
-            "6GB": "0",
-            "8GB": "0",
-            "10GB": "0",
-            "12GB": "0",
-            "16GB": "0",
-            "24GB": "0",
-            "32GB": "12000000000",
-            "48GB": "12000000000",
-            "80GB": "70000000000"
-        }
-        resolution_choices = list(ASPECT_RATIOS_14b.keys())
-        default_aspect = "16:9"
-    return mapping.get(preset, "12000000000"), resolution_choices, default_aspect
+        # BF16 mappings (unchanged)
+        if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)":
+            mapping = {
+                "4GB": "0",
+                "6GB": "500,000,000",
+                "8GB": "7,000,000,000",
+                "10GB": "7,000,000,000",
+                "12GB": "7,000,000,000",
+                "16GB": "7,000,000,000",
+                "24GB": "7,000,000,000",
+                "32GB": "7,000,000,000",
+                "48GB": "7,000,000,000",
+                "80GB": "7,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
+            default_aspect = "16:9"
+        elif model_choice == "WAN 2.1 14B Text-to-Video":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "0",
+                "16GB": "0",
+                "24GB": "4,250,000,000",
+                "32GB": "8,250,000,000",
+                "48GB": "22,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_14b.keys())
+            default_aspect = "16:9"
+        elif model_choice == "WAN 2.1 14B Image-to-Video 720P":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "0",
+                "16GB": "0",
+                "24GB": "3,000,000,000",
+                "32GB": "6,750,000,000",
+                "48GB": "16,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_14b.keys())
+            default_aspect = "16:9"
+        elif model_choice == "WAN 2.1 14B Image-to-Video 480P":
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "1,500,000,000",
+                "16GB": "3,500,000,000",
+                "24GB": "8,000,000,000",
+                "32GB": "12,000,000,000",
+                "48GB": "22,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_1_3b.keys())
+            default_aspect = "16:9"
+        else:
+            mapping = {
+                "4GB": "0",
+                "6GB": "0",
+                "8GB": "0",
+                "10GB": "0",
+                "12GB": "0",
+                "16GB": "0",
+                "24GB": "3,000,000,000",
+                "32GB": "6,750,000,000",
+                "48GB": "16,000,000,000",
+                "80GB": "22,000,000,000"
+            }
+            resolution_choices = list(ASPECT_RATIOS_14b.keys())
+            default_aspect = "16:9"
+        return mapping.get(preset, "12000000000"), resolution_choices, default_aspect
 
-def update_model_settings(model_choice, current_vram_preset):
-    num_persistent_val, aspect_options, default_aspect = update_vram_and_resolution(model_choice, current_vram_preset)
+# Updated update_model_settings to include torch_dtype
+def update_model_settings(model_choice, current_vram_preset, torch_dtype):
+    num_persistent_val, aspect_options, default_aspect = update_vram_and_resolution(model_choice, current_vram_preset, torch_dtype)
     if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P":
         default_width, default_height = ASPECT_RATIOS_1_3b.get(default_aspect, (832, 480))
     else:
@@ -500,7 +633,10 @@ def update_vram_on_change(preset, model_choice):
     """
     When the VRAM preset changes, update the num_persistent text field based on the current model.
     """
-    num_persistent_val, _, _ = update_vram_and_resolution(model_choice, preset)
+    # We need torch_dtype to update correctly, but this function is only used in generation.
+    # For consistency, we'll use the value from config_loaded for torch_dtype.
+    torch_dtype = config_loaded.get("torch_dtype", "torch.bfloat16")
+    num_persistent_val, _, _ = update_vram_and_resolution(model_choice, preset, torch_dtype)
     return num_persistent_val
 
 def prompt_enc(prompt, tar_lang):
@@ -583,7 +719,8 @@ def generate_videos(
         if input_image is not None:
             original_image = input_image.copy()
 
-    vram_value = num_persistent_input
+    num_persistent_input = str(num_persistent_input).replace(",", "")
+    vram_value = int(num_persistent_input)
 
     # Process LoRA inputs into a list.
     effective_loras = []
@@ -632,8 +769,10 @@ def generate_videos(
     total_iterations = len(prompts_list) * int(num_generations)
     iteration = 0
 
+    # Modified: Process the random tokens for every generation iteration.
     for p in prompts_list:
         for i in range(int(num_generations)):
+            final_prompt = process_random_prompt(p)
             if cancel_flag:
                 log_text += "[CMD] Generation cancelled by user.\n"
                 duration = time.time() - overall_start_time
@@ -647,7 +786,7 @@ def generate_videos(
                 return "", log_text, str(last_used_seed or "")
             iteration += 1
             gen_start = time.time()
-            log_text += f"[CMD] Generating video {iteration} of {total_iterations} with prompt: {p}\n"
+            log_text += f"[CMD] Generating video {iteration} of {total_iterations} with prompt: {final_prompt}\n"
             if use_random_seed:
                 current_seed = random.randint(0, 2**32 - 1)
             else:
@@ -658,7 +797,7 @@ def generate_videos(
             last_used_seed = current_seed
             print(f"[CMD] Using resolution: width={target_width} height={target_height}")
             common_args = {
-                "prompt": p,
+                "prompt": final_prompt,
                 "negative_prompt": negative_prompt,
                 "num_inference_steps": int(inference_steps),
                 "seed": current_seed,
@@ -727,7 +866,7 @@ def generate_videos(
             if save_prompt:
                 text_filename = os.path.splitext(video_filename)[0] + ".txt"
                 generation_details = ""
-                generation_details += f"Prompt: {p}\n"
+                generation_details += f"Prompt: {final_prompt}\n"  # Save the processed prompt
                 generation_details += f"Negative Prompt: {negative_prompt}\n"
                 generation_details += f"Used Model: {model_choice_radio}\n"
                 generation_details += f"Number of Inference Steps: {inference_steps}\n"
@@ -806,8 +945,8 @@ def batch_process_videos(
 
     target_width = int(width)
     target_height = int(height)
-    
-    vram_value = num_persistent_input
+    num_persistent_input = str(num_persistent_input).replace(",", "")
+    vram_value = int(num_persistent_input)
     if model_choice_radio == "WAN 2.1 14B Image-to-Video 720P":
         model_choice = "14B_image_720p"
     else:
@@ -887,6 +1026,9 @@ def batch_process_videos(
             else:
                 log_text += f"[CMD] Using user made prompt txt for {image_file}: {prompt_content}\n"
 
+        # Process the random prompt tokens
+        final_prompt = process_random_prompt(prompt_content)
+
         output_filename = os.path.join(batch_output_folder, base + ".mp4")
         if skip_overwrite and os.path.exists(output_filename):
             log_text += f"[CMD] Output video {output_filename} already exists, skipping {image_file}.\n"
@@ -901,7 +1043,7 @@ def batch_process_videos(
                 current_seed = 0
 
         common_args = common_args_base.copy()
-        common_args["prompt"] = prompt_content
+        common_args["prompt"] = final_prompt
         common_args["seed"] = current_seed
 
         # Add TeaCache parameters to common_args.
@@ -916,7 +1058,10 @@ def batch_process_videos(
         
         try:
             image_path = os.path.join(folder_path, image_file)
-            image_obj = Image.open(image_path).convert("RGB")
+            # Modified: Apply EXIF orientation correction using ImageOps.exif_transpose
+            image_obj = Image.open(image_path)
+            image_obj = ImageOps.exif_transpose(image_obj)
+            image_obj = image_obj.convert("RGB")
         except Exception as e:
             log_text += f"[CMD] Failed to open image {image_file}: {str(e)}\n"
             continue
@@ -945,7 +1090,7 @@ def batch_process_videos(
         if save_prompt:
             text_filename = os.path.splitext(output_filename)[0] + ".txt"
             generation_details = ""
-            generation_details += f"Prompt: {prompt_content}\n"
+            generation_details += f"Prompt: {final_prompt}\n"  # Save the processed prompt
             generation_details += f"Negative Prompt: {negative_prompt}\n"
             generation_details += f"Used Model: {model_choice_radio}\n"
             generation_details += f"Number of Inference Steps: {inference_steps}\n"
@@ -1066,6 +1211,7 @@ def load_wan_pipeline(model_choice, torch_dtype_str, num_persistent, lora_path=N
                                   os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-720P", "models_t5_umt5-xxl-enc-bf16.pth"))
         vae_path = get_common_file(os.path.join("models", "Wan2.1_VAE.pth"),
                                   os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-720P", "Wan2.1_VAE.pth"))
+        model_manager.load_models([clip_path], torch_dtype=torch.float32)
         model_manager.load_models(
             [
                 [
@@ -1077,12 +1223,11 @@ def load_wan_pipeline(model_choice, torch_dtype_str, num_persistent, lora_path=N
                     os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-720P", "diffusion_pytorch_model-00006-of-00007.safetensors"),
                     os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-720P", "diffusion_pytorch_model-00007-of-00007.safetensors"),
                 ],
-                clip_path,
                 t5_path,
                 vae_path,
             ],
             torch_dtype=torch_dtype,
-        )
+        )        
     elif model_choice == "14B_image_480p":
         clip_path = get_common_file(os.path.join("models", "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
                                     os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-480P", "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"))
@@ -1090,6 +1235,7 @@ def load_wan_pipeline(model_choice, torch_dtype_str, num_persistent, lora_path=N
                                   os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-480P", "models_t5_umt5-xxl-enc-bf16.pth"))
         vae_path = get_common_file(os.path.join("models", "Wan2.1_VAE.pth"),
                                   os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-480P", "Wan2.1_VAE.pth"))
+        model_manager.load_models([clip_path], torch_dtype=torch.float32)                                  
         model_manager.load_models(
             [
                 [
@@ -1101,7 +1247,6 @@ def load_wan_pipeline(model_choice, torch_dtype_str, num_persistent, lora_path=N
                     os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-480P", "diffusion_pytorch_model-00006-of-00007.safetensors"),
                     os.path.join("models", "Wan-AI", "Wan2.1-I2V-14B-480P", "diffusion_pytorch_model-00007-of-00007.safetensors"),
                 ],
-                clip_path,
                 t5_path,
                 vae_path,
             ],
@@ -1158,14 +1303,14 @@ if __name__ == "__main__":
     prompt_expander = None
 
     with gr.Blocks() as demo:
-        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V32 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
+        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V37 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
         with gr.Row():
             with gr.Column(scale=4):
                 # Model & Resolution settings
                 with gr.Row():
                     generate_button = gr.Button("Generate", variant="primary")
                     cancel_button = gr.Button("Cancel")
-                prompt_box = gr.Textbox(label="Prompt", placeholder="Describe the video you want to generate", lines=5)                
+                prompt_box = gr.Textbox(label="Prompt (A <random: green , yellow , etc > car) will take random word with trim like : A yellow car", placeholder="Describe the video you want to generate", lines=5)                
                 with gr.Row():
                     gr.Markdown("### Model & Resolution")
                 with gr.Row():
@@ -1209,7 +1354,7 @@ if __name__ == "__main__":
                     num_persistent_text = gr.Textbox(label="Number of Persistent Parameters In Dit (VRAM)", value=config_loaded.get("num_persistent", "12000000000"))
                     torch_dtype_radio = gr.Radio(
                         choices=["torch.float8_e4m3fn", "torch.bfloat16"],
-                        label="Torch DType: float8 (FP8) reduces VRAM and RAM Usage",
+                        label="torch.float8_e4m3fn is FP8 and reduces VRAM and RAM usage a lot with little quality loss. torch.bfloat16 is BF16 (max quality)",
                         value=config_loaded.get("torch_dtype", "torch.bfloat16")
                     )
                 gr.Markdown("### TeaCache Settings")
@@ -1229,8 +1374,7 @@ if __name__ == "__main__":
                 with gr.Row():
                     show_more_lora_button = gr.Button("Show More LoRAs")
                     more_lora_state = gr.State(False)
-                more_lora_container = gr.Column(visible=False)
-                with gr.Column(visible=False):
+                with gr.Column(visible=False) as more_lora_container:
                     lora_dropdown_2 = gr.Dropdown(label="LoRA Model 2", choices=get_lora_choices(), value=config_loaded.get("lora_model_2", "None"))
                     lora_alpha_slider_2 = gr.Slider(minimum=0.1, maximum=2.0, step=0.1, value=config_loaded.get("lora_alpha_2", 1.0), label="LoRA Scale 2")
                     lora_dropdown_3 = gr.Dropdown(label="LoRA Model 3", choices=get_lora_choices(), value=config_loaded.get("lora_model_3", "None"))
@@ -1238,7 +1382,6 @@ if __name__ == "__main__":
                     lora_dropdown_4 = gr.Dropdown(label="LoRA Model 4", choices=get_lora_choices(), value=config_loaded.get("lora_model_4", "None"))
                     lora_alpha_slider_4 = gr.Slider(minimum=0.1, maximum=2.0, step=0.1, value=config_loaded.get("lora_alpha_4", 1.0), label="LoRA Scale 4")
                 show_more_lora_button.click(fn=toggle_lora_visibility, inputs=[more_lora_state], outputs=[more_lora_container, more_lora_state, show_more_lora_button])
-
                 with gr.Row():
                     tar_lang = gr.Radio(choices=["CH", "EN"], label="Target language for prompt enhance", value=config_loaded.get("tar_lang", "EN"))
                     enhance_button = gr.Button("Prompt Enhance")
@@ -1285,12 +1428,27 @@ if __name__ == "__main__":
                 open_outputs_button = gr.Button("Open Outputs Folder")
 
         # Register change callbacks
+        
         model_choice_radio.change(
             fn=update_model_settings,
-            inputs=[model_choice_radio, vram_preset_radio],
+            inputs=[model_choice_radio, vram_preset_radio, torch_dtype_radio],
             outputs=[aspect_ratio_radio, width_slider, height_slider, num_persistent_text]
         )
-        # New: Update TeaCache Model ID based on model choice.
+        vram_preset_radio.change(
+            fn=update_model_settings,
+            inputs=[model_choice_radio, vram_preset_radio, torch_dtype_radio],
+            outputs=[aspect_ratio_radio, width_slider, height_slider, num_persistent_text]
+        )
+        torch_dtype_radio.change(
+            fn=update_model_settings,
+            inputs=[model_choice_radio, vram_preset_radio, torch_dtype_radio],
+            outputs=[aspect_ratio_radio, width_slider, height_slider, num_persistent_text]
+        )
+        aspect_ratio_radio.change(
+            fn=update_width_height,
+            inputs=[aspect_ratio_radio, model_choice_radio],
+            outputs=[width_slider, height_slider]
+        )
         model_choice_radio.change(
             fn=update_tea_cache_model_id,
             inputs=[model_choice_radio],
@@ -1353,7 +1511,7 @@ if __name__ == "__main__":
             ],
             outputs=batch_status_output
         )
-        cancel_batch_process_button.click(fn=batch_process_videos, outputs=batch_status_output)
+        cancel_batch_process_button.click(fn=cancel_batch_process, outputs=batch_status_output)
         load_config_button.click(
             fn=load_config,
             inputs=[config_dropdown],
@@ -1392,6 +1550,17 @@ if __name__ == "__main__":
                 enable_teacache_checkbox, tea_cache_l1_thresh_slider, tea_cache_model_id_textbox
             ],
             outputs=[config_status, config_dropdown]
+        )
+
+        image_input.change(
+            fn=update_target_dimensions,
+            inputs=[image_input, auto_scale_checkbox, width_slider, height_slider],
+            outputs=[width_slider, height_slider]
+        )
+        auto_scale_checkbox.change(
+            fn=update_target_dimensions,
+            inputs=[image_input, auto_scale_checkbox, width_slider, height_slider],
+            outputs=[width_slider, height_slider]
         )
 
         demo.launch(share=args.share, inbrowser=True)
