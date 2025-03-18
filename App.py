@@ -791,7 +791,8 @@ def generate_videos(
                 current_seed = random.randint(0, 2**32 - 1)
             else:
                 try:
-                    current_seed = int(seed_input) if seed_input.strip() != "" else 0
+                    base_seed = int(seed_input.strip()) if seed_input.strip() != "" else 0
+                    current_seed = base_seed + iteration - 1
                 except:
                     current_seed = 0
             last_used_seed = current_seed
@@ -870,6 +871,8 @@ def generate_videos(
                 generation_details += f"Negative Prompt: {negative_prompt}\n"
                 generation_details += f"Used Model: {model_choice_radio}\n"
                 generation_details += f"Number of Inference Steps: {inference_steps}\n"
+                generation_details += f"CFG Scale: {cfg_scale}\n"
+                generation_details += f"Sigma Shift: {sigma_shift}\n"
                 generation_details += f"Seed: {current_seed}\n"
                 generation_details += f"Number of Frames: {effective_num_frames}\n"
                 if model_choice == "1.3B" and input_video is not None:
@@ -1006,6 +1009,8 @@ def batch_process_videos(
     total_files = len(images)
     log_text += f"[CMD] Found {total_files} image files in folder {folder_path}\n"
     
+    seed_counter = 0  # Counter for manual seed incrementation
+    
     for image_file in images:
         if cancel_batch_flag:
             log_text += "[CMD] Batch processing cancelled by user.\n"
@@ -1038,7 +1043,9 @@ def batch_process_videos(
             current_seed = random.randint(0, 2**32 - 1)
         else:
             try:
-                current_seed = int(seed_input) if seed_input.strip() != "" else 0
+                base_seed = int(seed_input.strip()) if seed_input.strip() != "" else 0
+                current_seed = base_seed + seed_counter
+                seed_counter += 1
             except:
                 current_seed = 0
 
@@ -1094,6 +1101,8 @@ def batch_process_videos(
             generation_details += f"Negative Prompt: {negative_prompt}\n"
             generation_details += f"Used Model: {model_choice_radio}\n"
             generation_details += f"Number of Inference Steps: {inference_steps}\n"
+            generation_details += f"CFG Scale: {cfg_scale}\n"
+            generation_details += f"Sigma Shift: {sigma_shift}\n"
             generation_details += f"Seed: {current_seed}\n"
             generation_details += f"Number of Frames: {num_frames}\n"
             generation_details += f"Denoising Strength: {denoising_strength}\n"
@@ -1287,6 +1296,15 @@ def get_lora_choices():
 def refresh_lora_list():
     return gr.update(choices=get_lora_choices(), value="None")
 
+# ------------------------------
+# New helper function: Fast Preset
+# ------------------------------
+def apply_fast_preset():
+    """
+    Sets inference_steps to 20, TeaCache L1 Threshold to 0.25, and Sigma Shift to 10.
+    """
+    return 50, True , 0.25, 10
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt_extend_method", type=str, default="local_qwen", choices=["dashscope", "local_qwen"],
@@ -1303,13 +1321,14 @@ if __name__ == "__main__":
     prompt_expander = None
 
     with gr.Blocks() as demo:
-        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V37 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
+        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V40 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
         with gr.Row():
             with gr.Column(scale=4):
                 # Model & Resolution settings
                 with gr.Row():
                     generate_button = gr.Button("Generate", variant="primary")
                     cancel_button = gr.Button("Cancel")
+                    fast_preset_button = gr.Button("Apply Fast Preset", variant="huggingface")
                 prompt_box = gr.Textbox(label="Prompt (A <random: green , yellow , etc > car) will take random word with trim like : A yellow car", placeholder="Describe the video you want to generate", lines=5)                
                 with gr.Row():
                     gr.Markdown("### Model & Resolution")
@@ -1454,7 +1473,6 @@ if __name__ == "__main__":
             inputs=[model_choice_radio],
             outputs=[tea_cache_model_id_textbox]
         )
-
         enhance_button.click(fn=prompt_enc, inputs=[prompt_box, tar_lang], outputs=prompt_box)
         generate_button.click(
             fn=generate_videos,
@@ -1475,6 +1493,7 @@ if __name__ == "__main__":
             outputs=[video_output, status_output, last_seed_output]
         )
         cancel_button.click(fn=cancel_generation, outputs=status_output)
+        fast_preset_button.click(fn=apply_fast_preset, inputs=[], outputs=[inference_steps_slider, enable_teacache_checkbox , tea_cache_l1_thresh_slider, sigma_shift_slider])
         open_outputs_button.click(fn=open_outputs_folder, outputs=status_output)
         batch_process_button.click(
             fn=batch_process_videos,
