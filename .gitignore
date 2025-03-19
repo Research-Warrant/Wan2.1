@@ -108,11 +108,13 @@ models
 *.html
 *.pdf
 *.whl
+used_last_frames
 cache
 DiffSynth-Studio
 outputs
 configs
 venv
+App - Copy.py
 __pycache__/
 storage/
 samples/
@@ -133,3 +135,12 @@ __rzi_23488.17853.rartemp
 !Dockerfile
 !assets/*.png
 !assets/*.jpg
+.DS_Store
+*DS_Store
+google/
+Wan2.1-T2V-14B/
+Wan2.1-T2V-1.3B/
+Wan2.1-I2V-14B-480P/
+Wan2.1-I2V-14B-720P/
+Practical-RIFE
+used_last_frames/
