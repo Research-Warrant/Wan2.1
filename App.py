@@ -25,6 +25,14 @@ from wan.utils.utils import cache_video
 from diffsynth import ModelManager, WanVideoPipeline, save_video, VideoData
 from modelscope import snapshot_download, dataset_snapshot_download
 
+# Global variables
+loaded_pipeline = None
+loaded_pipeline_config = {}
+cancel_flag = False
+cancel_batch_flag = False
+prompt_expander = None
+last_selected_aspect_ratio = None
+
 # ------------------------- Utility Functions -------------------------
 
 def extract_last_frame(video_path):
@@ -40,12 +48,100 @@ def extract_last_frame(video_path):
         return Image.fromarray(frame)
     return None
 
-def merge_videos(video_files):
+def generate_prompt_info(parameters):
+    """
+    Generate prompt info text from parameters dict.
+    """
+    details = ""
+    details += f"Prompt: {parameters['prompt']}\n"
+    details += f"Negative Prompt: {parameters['negative_prompt']}\n"
+    
+    # Add clarity for extension models
+    if 'extension_segment' in parameters and parameters['extension_segment'] > 0:
+        details += f"Used Model: {parameters['model_choice']} (Extension Model)\n"
+    else:
+        details += f"Used Model: {parameters['model_choice']}\n"
+    
+    if 'extension_model' in parameters:
+        details += f"Extension Model: {parameters['extension_model']}\n"
+    
+    details += f"Number of Inference Steps: {parameters['inference_steps']}\n"
+    details += f"CFG Scale: {parameters['cfg_scale']}\n"
+    details += f"Sigma Shift: {parameters['sigma_shift']}\n"
+    details += f"Seed: {parameters['seed']}\n"
+    details += f"Number of Frames: {parameters['num_frames']}\n"
+    
+    if 'extend_factor' in parameters:
+        details += f"Extend Factor: {parameters['extend_factor']}x\n"
+    
+    if 'num_segments' in parameters:
+        details += f"Number of Segments: {parameters['num_segments']}\n"
+    
+    if 'extension_segment' in parameters:
+        details += f"Extension Segment: {parameters['extension_segment']} of {parameters['total_extensions']}\n"
+    
+    if 'source_frame' in parameters:
+        details += f"Used Last Frame From: {parameters['source_frame']}\n"
+    
+    if 'input_file' in parameters:
+        if parameters.get('is_video', False):
+            details += f"Input Video: {parameters['input_file']}\n"
+        else:
+            details += f"Input Image: {parameters['input_file']}\n"
+    
+    if 'denoising_strength' in parameters:
+        if parameters.get('is_text_to_video', False) and not parameters.get('has_input_video', False):
+            details += "Denoising Strength: N/A\n"
+        else:
+            details += f"Denoising Strength: {parameters['denoising_strength']}\n"
+    
+    if 'pr_rife_enabled' in parameters and parameters['pr_rife_enabled']:
+        details += f"Practical-RIFE: Enabled, Multiplier: {parameters.get('pr_rife_multiplier', '(unspecified)')}\n"
+    
+    if 'segment_details' in parameters:
+        if isinstance(parameters['segment_details'], list):
+            for detail in parameters['segment_details']:
+                if isinstance(detail, tuple):
+                    i, text = detail
+                    details += f"Extension segment {i}: {text}\n"
+                else:
+                    details += f"{detail}\n"
+    
+    if 'lora_details' in parameters:
+        if parameters['lora_details']:
+            details += f"LoRA Models: {parameters['lora_details']}\n"
+        else:
+            details += "LoRA Model: None\n"
+    
+    details += f"TeaCache Enabled: {parameters['enable_teacache']}\n"
+    if parameters['enable_teacache']:
+        details += f"TeaCache L1 Threshold: {parameters['tea_cache_l1_thresh']}\n"
+        details += f"TeaCache Model ID: {parameters['tea_cache_model_id']}\n"
+    
+    details += f"Precision: {'FP8' if parameters['torch_dtype'] == 'torch.float8_e4m3fn' else 'BF16'}\n"
+    details += f"Auto Crop: {'Enabled' if parameters.get('auto_crop', False) else 'Disabled'}\n"
+    details += f"Final Resolution: {parameters['width']}x{parameters['height']}\n"
+    
+    if 'video_generation_duration' in parameters:
+        details += f"Video Generation Duration: {parameters['video_generation_duration']:.2f} seconds"
+        if parameters.get('include_minutes', False):
+            details += f" / {parameters['video_generation_duration']/60:.2f} minutes"
+        details += "\n"
+    
+    if 'generation_duration' in parameters:
+        details += f"Total Processing Duration: {parameters['generation_duration']:.2f} seconds"
+        if parameters.get('include_minutes', False):
+            details += f" / {parameters['generation_duration']/60:.2f} minutes"
+        details += "\n"
+    
+    return details
+
+def merge_videos(video_files, output_dir="outputs"):
     filelist_path = os.path.join(tempfile.gettempdir(), "filelist.txt")
     with open(filelist_path, "w", encoding="utf-8") as f:
         for vf in video_files:
             f.write(f"file '{os.path.abspath(vf)}'\n")
-    merged_video = get_next_filename(".mp4")
+    merged_video = get_next_filename(".mp4", output_dir=output_dir)
     cmd = f'ffmpeg -f concat -safe 0 -i "{filelist_path}" -c copy "{merged_video}"'
     subprocess.run(cmd, shell=True, check=True)
     os.remove(filelist_path)
@@ -73,15 +169,26 @@ def get_common_file(new_path, old_path):
 # ------------------------- Pipeline Management Helpers -------------------------
 
 def has_model_config_changed(old_config, new_config):
-    keys_to_compare = [
-        "model_choice", "torch_dtype", "num_persistent",
+    critical_keys = ["model_choice", "torch_dtype", "num_persistent"]
+    for key in critical_keys:
+        if str(old_config.get(key)) != str(new_config.get(key)):
+            print(f"[CMD - DEBUG] Critical config change detected in {key}: {old_config.get(key)} != {new_config.get(key)}")
+            return True
+    
+    lora_keys = [
         "lora_model", "lora_alpha",
         "lora_model_2", "lora_alpha_2",
         "lora_model_3", "lora_alpha_3",
         "lora_model_4", "lora_alpha_4"
     ]
-    for key in keys_to_compare:
-        if old_config.get(key) != new_config.get(key):
+    
+    for key in lora_keys:
+        old_val = old_config.get(key)
+        new_val = new_config.get(key)
+        if str(old_val).strip() in ["", "None"] and str(new_val).strip() in ["", "None"]:
+            continue
+        if str(old_val) != str(new_val):
+            print(f"[CMD - DEBUG] LoRA config change detected in {key}: {old_val} != {new_val}")
             return True
     return False
 
@@ -109,8 +216,13 @@ def clear_pipeline_if_needed(pipeline, pipeline_config, new_config):
             print(f"[CMD - DEBUG] model_manager is None OR hasattr(model_manager, 'clear_models') is False. Skipping model_manager.clear_models()")
         try:
             del model_manager
+            model_manager = None
         except Exception as e:
             print(f"[CMD] Error deleting model_manager: {e}")
+
+        if model_manager is None:
+            print(f"[CMD - DEBUG] Reinitializing model_manager")
+            model_manager = ModelManager(device="cpu")
 
         gc.collect()
         gc.collect()
@@ -142,8 +254,8 @@ def get_default_config():
         "inference_steps": 50,
         "pr_rife": True,
         "pr_rife_multiplier": "2x FPS",
-        "cfg_scale": 6.0,
-        "sigma_shift": 6.0,
+        "cfg_scale": 5.0,
+        "sigma_shift": 5.6,
         "num_persistent": "12000000000",
         "torch_dtype": "torch.bfloat16",
         "lora_model": "None",
@@ -155,6 +267,7 @@ def get_default_config():
         "lora_model_4": "None",
         "lora_alpha_4": 1.0,
         "clear_cache_after_gen": DEFAULT_CLEAR_CACHE,
+        "prompt": "",
         "negative_prompt": "Overexposure, static, blurred details, subtitles, paintings, pictures, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, redundant fingers, poorly painted hands, poorly painted faces, deformed, disfigured, deformed limbs, fused fingers, cluttered background, three legs, a lot of people in the background, upside down",
         "save_prompt": True,
         "multiline": False,
@@ -230,9 +343,12 @@ def save_config(config_name, model_choice, vram_preset, aspect_ratio, width, hei
                 lora_model_2, lora_alpha_2, lora_model_3, lora_alpha_3, lora_model_4, lora_alpha_4, clear_cache_after_gen,
                 negative_prompt, save_prompt, multiline, num_generations, use_random_seed, seed, quality, fps, num_frames,
                 denoising_strength, tar_lang, batch_folder, batch_output_folder, skip_overwrite, save_prompt_batch,
-                enable_teacache, tea_cache_l1_thresh, tea_cache_model_id, extend_factor):
+                enable_teacache, tea_cache_l1_thresh, tea_cache_model_id, extend_factor, prompt):
     if not config_name:
         return "Config name cannot be empty", gr.update(choices=get_config_list())
+    
+    prompt = str(prompt) if prompt is not None else ""
+    
     config_data = {
         "model_choice": model_choice,
         "vram_preset": vram_preset,
@@ -258,6 +374,7 @@ def save_config(config_name, model_choice, vram_preset, aspect_ratio, width, hei
         "lora_model_4": lora_model_4,
         "lora_alpha_4": lora_alpha_4,
         "clear_cache_after_gen": clear_cache_after_gen,
+        "prompt": prompt,
         "negative_prompt": negative_prompt,
         "save_prompt": save_prompt,
         "multiline": multiline,
@@ -278,17 +395,120 @@ def save_config(config_name, model_choice, vram_preset, aspect_ratio, width, hei
         "tea_cache_model_id": tea_cache_model_id,
         "extend_factor": extend_factor
     }
-    config_path = os.path.join(CONFIG_DIR, f"{config_name}.json")
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=4)
-    with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as f:
-        f.write(config_name)
-    return f"Config '{config_name}' saved.", gr.update(choices=get_config_list(), value=config_name)
+    
+    try:
+        config_path = os.path.join(CONFIG_DIR, f"{config_name}.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config_data, f, indent=4, ensure_ascii=False)
+        with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(config_name)
+        
+        global last_selected_aspect_ratio
+        last_selected_aspect_ratio = aspect_ratio
+        
+        return (
+            f"Config '{config_name}' saved and loaded.",
+            gr.update(choices=get_config_list(), value=config_name),
+            model_choice,
+            vram_preset,
+            aspect_ratio,
+            width,
+            height,
+            auto_crop,
+            auto_scale,
+            tiled,
+            inference_steps,
+            pr_rife,
+            pr_rife_multiplier,
+            cfg_scale,
+            sigma_shift,
+            num_persistent,
+            torch_dtype,
+            lora_model,
+            lora_alpha,
+            lora_model_2,
+            lora_alpha_2,
+            lora_model_3,
+            lora_alpha_3,
+            lora_model_4,
+            lora_alpha_4,
+            clear_cache_after_gen,
+            negative_prompt,
+            save_prompt,
+            multiline,
+            num_generations,
+            use_random_seed,
+            seed,
+            quality,
+            fps,
+            num_frames,
+            denoising_strength,
+            tar_lang,
+            batch_folder,
+            batch_output_folder,
+            skip_overwrite,
+            save_prompt_batch,
+            enable_teacache,
+            tea_cache_l1_thresh,
+            tea_cache_model_id,
+            extend_factor,
+            prompt
+        )
+    except Exception as e:
+        return (
+            f"Error saving config: {str(e)}",
+            gr.update(choices=get_config_list()),
+            model_choice,
+            vram_preset,
+            aspect_ratio,
+            width,
+            height,
+            auto_crop,
+            auto_scale,
+            tiled,
+            inference_steps,
+            pr_rife,
+            pr_rife_multiplier,
+            cfg_scale,
+            sigma_shift,
+            num_persistent,
+            torch_dtype,
+            lora_model,
+            lora_alpha,
+            lora_model_2,
+            lora_alpha_2,
+            lora_model_3,
+            lora_alpha_3,
+            lora_model_4,
+            lora_alpha_4,
+            clear_cache_after_gen,
+            negative_prompt,
+            save_prompt,
+            multiline,
+            num_generations,
+            use_random_seed,
+            seed,
+            quality,
+            fps,
+            num_frames,
+            denoising_strength,
+            tar_lang,
+            batch_folder,
+            batch_output_folder,
+            skip_overwrite,
+            save_prompt_batch,
+            enable_teacache,
+            tea_cache_l1_thresh,
+            tea_cache_model_id,
+            extend_factor,
+            prompt
+        )
 
 def load_config(selected_config):
-    config_path = os.path.join(CONFIG_DIR, f"{selected_config}.json")
+    global last_selected_aspect_ratio
+    
     default_vals = get_default_config()
-    if not os.path.exists(config_path):
+    if not os.path.exists(os.path.join(CONFIG_DIR, f"{selected_config}.json")):
         return (
             f"Config '{selected_config}' not found.",
             default_vals["model_choice"],
@@ -333,58 +553,113 @@ def load_config(selected_config):
             default_vals["enable_teacache"],
             default_vals["tea_cache_l1_thresh"],
             default_vals["tea_cache_model_id"],
-            default_vals["extend_factor"]
+            default_vals["extend_factor"],
+            default_vals["prompt"]
         )
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = json.load(f)
-    with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as f:
-        f.write(selected_config)
-    return (
-        f"Config '{selected_config}' loaded.",
-        config_data.get("model_choice", "WAN 2.1 1.3B (Text/Video-to-Video)"),
-        config_data.get("vram_preset", "24GB"),
-        config_data.get("aspect_ratio", "16:9"),
-        config_data.get("width", 832),
-        config_data.get("height", 480),
-        config_data.get("auto_crop", True),
-        config_data.get("auto_scale", False),
-        config_data.get("tiled", True),
-        config_data.get("inference_steps", 50),
-        config_data.get("pr_rife", True),
-        config_data.get("pr_rife_multiplier", "2x FPS"),
-        config_data.get("cfg_scale", 6.0),
-        config_data.get("sigma_shift", 6.0),
-        config_data.get("num_persistent", "12000000000"),
-        config_data.get("torch_dtype", "torch.bfloat16"),
-        config_data.get("lora_model", "None"),
-        config_data.get("lora_alpha", 1.0),
-        config_data.get("lora_model_2", "None"),
-        config_data.get("lora_alpha_2", 1.0),
-        config_data.get("lora_model_3", "None"),
-        config_data.get("lora_alpha_3", 1.0),
-        config_data.get("lora_model_4", "None"),
-        config_data.get("lora_alpha_4", 1.0),
-        config_data.get("clear_cache_after_gen", DEFAULT_CLEAR_CACHE),
-        config_data.get("negative_prompt", "Overexposure, static, blurred details, subtitles, paintings, pictures, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, redundant fingers, poorly painted hands, poorly painted faces, deformed, disfigured, deformed limbs, fused fingers, cluttered background, three legs, a lot of people in the background, upside down"),
-        config_data.get("save_prompt", True),
-        config_data.get("multiline", False),
-        config_data.get("num_generations", 1),
-        config_data.get("use_random_seed", True),
-        config_data.get("seed", ""),
-        config_data.get("quality", 5),
-        config_data.get("fps", 16),
-        config_data.get("num_frames", 81),
-        config_data.get("denoising_strength", 0.7),
-        config_data.get("tar_lang", "EN"),
-        config_data.get("batch_folder", "batch_inputs"),
-        config_data.get("batch_output_folder", "batch_outputs"),
-        config_data.get("skip_overwrite", True),
-        config_data.get("save_prompt_batch", True),
-        config_data.get("enable_teacache", False),
-        config_data.get("tea_cache_l1_thresh", 0.15),
-        config_data.get("tea_cache_model_id", "Wan2.1-T2V-1.3B"),
-        config_data.get("extend_factor", 1)
-    )
+    
+    try:
+        with open(os.path.join(CONFIG_DIR, f"{selected_config}.json"), "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+        with open(LAST_CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(selected_config)
+        
+        last_selected_aspect_ratio = config_data.get("aspect_ratio", "16:9")
+        
+        return (
+            f"Config '{selected_config}' loaded.",
+            config_data.get("model_choice", "WAN 2.1 1.3B (Text/Video-to-Video)"),
+            config_data.get("vram_preset", "24GB"),
+            config_data.get("aspect_ratio", "16:9"),
+            config_data.get("width", 832),
+            config_data.get("height", 480),
+            config_data.get("auto_crop", True),
+            config_data.get("auto_scale", False),
+            config_data.get("tiled", True),
+            config_data.get("inference_steps", 50),
+            config_data.get("pr_rife", True),
+            config_data.get("pr_rife_multiplier", "2x FPS"),
+            config_data.get("cfg_scale", 5.0),
+            config_data.get("sigma_shift", 5.6),
+            config_data.get("num_persistent", "12000000000"),
+            config_data.get("torch_dtype", "torch.bfloat16"),
+            config_data.get("lora_model", "None"),
+            config_data.get("lora_alpha", 1.0),
+            config_data.get("lora_model_2", "None"),
+            config_data.get("lora_alpha_2", 1.0),
+            config_data.get("lora_model_3", "None"),
+            config_data.get("lora_alpha_3", 1.0),
+            config_data.get("lora_model_4", "None"),
+            config_data.get("lora_alpha_4", 1.0),
+            config_data.get("clear_cache_after_gen", DEFAULT_CLEAR_CACHE),
+            config_data.get("negative_prompt", "Overexposure, static, blurred details, subtitles, paintings, pictures, still, overall gray, worst quality, low quality, JPEG compression residue, ugly, mutilated, redundant fingers, poorly painted hands, poorly painted faces, deformed, disfigured, deformed limbs, fused fingers, cluttered background, three legs, a lot of people in the background, upside down"),
+            config_data.get("save_prompt", True),
+            config_data.get("multiline", False),
+            config_data.get("num_generations", 1),
+            config_data.get("use_random_seed", True),
+            config_data.get("seed", ""),
+            config_data.get("quality", 5),
+            config_data.get("fps", 16),
+            config_data.get("num_frames", 81),
+            config_data.get("denoising_strength", 0.7),
+            config_data.get("tar_lang", "EN"),
+            config_data.get("batch_folder", "batch_inputs"),
+            config_data.get("batch_output_folder", "batch_outputs"),
+            config_data.get("skip_overwrite", True),
+            config_data.get("save_prompt_batch", True),
+            config_data.get("enable_teacache", False),
+            config_data.get("tea_cache_l1_thresh", 0.15),
+            config_data.get("tea_cache_model_id", "Wan2.1-T2V-1.3B"),
+            config_data.get("extend_factor", 1),
+            config_data.get("prompt", "")
+        )
+    except Exception as e:
+        return (
+            f"Error loading config: {str(e)}",
+            default_vals["model_choice"],
+            default_vals["vram_preset"],
+            default_vals["aspect_ratio"],
+            default_vals["width"],
+            default_vals["height"],
+            default_vals["auto_crop"],
+            default_vals["auto_scale"],
+            default_vals["tiled"],
+            default_vals["inference_steps"],
+            default_vals["pr_rife"],
+            default_vals["pr_rife_multiplier"],
+            default_vals["cfg_scale"],
+            default_vals["sigma_shift"],
+            default_vals["num_persistent"],
+            default_vals["torch_dtype"],
+            default_vals["lora_model"],
+            default_vals["lora_alpha"],
+            default_vals["lora_model_2"],
+            default_vals["lora_alpha_2"],
+            default_vals["lora_model_3"],
+            default_vals["lora_alpha_3"],
+            default_vals["lora_model_4"],
+            default_vals["lora_alpha_4"],
+            default_vals["clear_cache_after_gen"],
+            default_vals["negative_prompt"],
+            default_vals["save_prompt"],
+            default_vals["multiline"],
+            default_vals["num_generations"],
+            default_vals["use_random_seed"],
+            default_vals["seed"],
+            default_vals["quality"],
+            default_vals["fps"],
+            default_vals["num_frames"],
+            default_vals["denoising_strength"],
+            default_vals["tar_lang"],
+            default_vals["batch_folder"],
+            default_vals["batch_output_folder"],
+            default_vals["skip_overwrite"],
+            default_vals["save_prompt_batch"],
+            default_vals["enable_teacache"],
+            default_vals["tea_cache_l1_thresh"],
+            default_vals["tea_cache_model_id"],
+            default_vals["extend_factor"],
+            default_vals["prompt"]
+        )
 
 def process_random_prompt(prompt):
     pattern = r'<random:\s*([^>]+)>'
@@ -522,7 +797,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                 "12GB": "0",
                 "16GB": "0",
                 "24GB": "6,000,000,000",
-                "32GB": "15,000,000,000",
+                "32GB": "14,000,000,000",
                 "48GB": "22,000,000,000",
                 "80GB": "22,000,000,000"
             }
@@ -568,7 +843,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                     "12GB": "0",
                     "16GB": "0",
                     "24GB": "3,000,000,000",
-                    "32GB": "6,750,000,000",
+                    "32GB": "6,500,000,000",
                     "48GB": "16,000,000,000",
                     "80GB": "22,000,000,000"
                 }
@@ -600,7 +875,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                 "12GB": "0",
                 "16GB": "0",
                 "24GB": "4,250,000,000",
-                "32GB": "7,250,000,000",
+                "32GB": "6,500,000,000",
                 "48GB": "22,000,000,000",
                 "80GB": "22,000,000,000"
             }
@@ -615,7 +890,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                 "12GB": "0",
                 "16GB": "0",
                 "24GB": "3,000,000,000",
-                "32GB": "5,750,000,000",
+                "32GB": "5,500,000,000",
                 "48GB": "14,500,000,000",
                 "80GB": "22,000,000,000"
             }
@@ -630,7 +905,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                 "12GB": "1,500,000,000",
                 "16GB": "3,500,000,000",
                 "24GB": "8,000,000,000",
-                "32GB": "11,000,000,000",
+                "32GB": "10,500,000,000",
                 "48GB": "22,000,000,000",
                 "80GB": "22,000,000,000"
             }
@@ -645,7 +920,7 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
                 "12GB": "0",
                 "16GB": "0",
                 "24GB": "3,000,000,000",
-                "32GB": "5,750,000,000",
+                "32GB": "5,500,000,000",
                 "48GB": "16,000,000,000",
                 "80GB": "22,000,000,000"
             }
@@ -654,23 +929,88 @@ def update_vram_and_resolution(model_choice, preset, torch_dtype):
         return mapping.get(preset, "12000000000"), resolution_choices, default_aspect
 
 def update_model_settings(model_choice, current_vram_preset, torch_dtype):
+    global last_selected_aspect_ratio
+    
     num_persistent_val, aspect_options, default_aspect = update_vram_and_resolution(model_choice, current_vram_preset, torch_dtype)
-    if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P":
-        default_width, default_height = ASPECT_RATIOS_1_3b.get(default_aspect, (832, 480))
+    
+    aspect_to_use = last_selected_aspect_ratio if last_selected_aspect_ratio else default_aspect
+    
+    # The issue is here - we need to preserve the low aspect ratio even when switching models
+    # If the aspect ratio includes "_low" suffix, we should try to find the base aspect ratio
+    if aspect_to_use and "_low" in aspect_to_use:
+        base_aspect = aspect_to_use.split("_")[0]  # Extract base aspect ratio without "_low"
+        
+        # If switching to 1.3B model from 14B with a low aspect ratio
+        if (model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P"):
+            # Check if base aspect exists in 1.3B options
+            if base_aspect in ASPECT_RATIOS_1_3b:
+                aspect_to_use = base_aspect
+            else:
+                aspect_to_use = default_aspect
+        # Keep the "_low" version when using 14B models
+        else:
+            # If the low variant isn't in choices, fall back to base aspect
+            if aspect_to_use not in ASPECT_RATIOS_14b:
+                if base_aspect in ASPECT_RATIOS_14b:
+                    aspect_to_use = base_aspect
+                else:
+                    aspect_to_use = default_aspect
     else:
-        default_width, default_height = ASPECT_RATIOS_14b.get(default_aspect, (1280, 720))
+        # Original logic for non-low aspect ratios
+        if (model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P"):
+            if aspect_to_use not in ASPECT_RATIOS_1_3b:
+                aspect_to_use = default_aspect
+            default_width, default_height = ASPECT_RATIOS_1_3b.get(aspect_to_use, (832, 480))
+        else:
+            if aspect_to_use not in ASPECT_RATIOS_14b:
+                aspect_to_use = default_aspect
+            default_width, default_height = ASPECT_RATIOS_14b.get(aspect_to_use, (1280, 720))
+    
+    # Get width and height based on selected aspect ratio
+    if (model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P"):
+        default_width, default_height = ASPECT_RATIOS_1_3b.get(aspect_to_use, (832, 480))
+    else:
+        default_width, default_height = ASPECT_RATIOS_14b.get(aspect_to_use, (1280, 720))
+    
     return (
-        gr.update(choices=aspect_options, value=default_aspect),
+        gr.update(choices=aspect_options, value=aspect_to_use),
         default_width,
         default_height,
         num_persistent_val
     )
 
 def update_width_height(aspect_ratio, model_choice):
+    global last_selected_aspect_ratio
+    if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P":
+        # For 1.3B models, we need to remove "_low" suffix if present, since it's only valid for 14B models
+        if aspect_ratio and "_low" in aspect_ratio:
+            base_aspect = aspect_ratio.split("_")[0]
+            if base_aspect in ASPECT_RATIOS_1_3b:
+                aspect_ratio = base_aspect
+            else:
+                aspect_ratio = "16:9"  # fallback
+        elif aspect_ratio not in ASPECT_RATIOS_1_3b:
+            aspect_ratio = "16:9"  # fallback to default if invalid for 1.3B
+    else:
+        # For 14B models, preserve the low aspect ratio if it exists
+        if aspect_ratio not in ASPECT_RATIOS_14b:
+            # If it has "_low" suffix but not in dictionary
+            if aspect_ratio and "_low" in aspect_ratio:
+                base_aspect = aspect_ratio.split("_")[0]
+                if base_aspect in ASPECT_RATIOS_14b:
+                    aspect_ratio = base_aspect
+                else:
+                    aspect_ratio = "16:9"  # fallback
+            else:
+                aspect_ratio = "16:9"  # fallback
+    
+    last_selected_aspect_ratio = aspect_ratio
+    
     if model_choice == "WAN 2.1 1.3B (Text/Video-to-Video)" or model_choice == "WAN 2.1 14B Image-to-Video 480P":
         default_width, default_height = ASPECT_RATIOS_1_3b.get(aspect_ratio, (832, 480))
     else:
         default_width, default_height = ASPECT_RATIOS_14b.get(aspect_ratio, (1280, 720))
+    
     return default_width, default_height
 
 def update_vram_on_change(preset, model_choice):
@@ -691,7 +1031,6 @@ def prompt_enc(prompt, tar_lang):
     result = prompt if not prompt_output.status else prompt_output.prompt
     return result
 
-# ------------------------- Detailed Extension Info -------------------------
 def show_extension_info():
     info = (
         "**Extended Video Feature – Detailed Explanation:**\n\n"
@@ -702,46 +1041,69 @@ def show_extension_info():
         "   - If the slider is set to **1×**, no extension is applied and only a single video segment is generated.\n"
         "   - For values greater than **1×**, the app first produces the initial video segment normally.\n\n"
         "2. **Determining the Number of Segments:**\n"
-        "   - For **image inputs**: The total number of segments equals the slider value (e.g., 2× produces the base segment plus one extension).\n"
-        "   - For **video inputs**: The app copies the original input video to the outputs folder and uses it as the first segment. In this case, the number of additional segments is calculated as: \n"
-        "     `additional_segments = extend_factor - 2`  (with 2 segments already present: the copied video and the first generated segment).\n\n"
+        "   - For **image inputs**: The total number of segments equals the slider value minus 1.\n"
+        "   - For **video inputs**: Similar logic applies (with some adjustments internally).\n\n"
         "3. **Extension Generation Process:**\n"
         "   - For each additional extension, the app extracts the last frame from the most recent segment using OpenCV.\n"
-        "   - This last frame is then re-fed to the generation pipeline using almost the same parameters, ensuring consistency.\n"
-        "   - The app may switch the model for the extension based on your original model selection:\n"
-        "       - If you used **'WAN 2.1 1.3B (Text/Video-to-Video)'**, then the extension is generated using **'WAN 2.1 14B Image-to-Video 480P'**.\n"
-        "       - If you used **'WAN 2.1 14B Text-to-Video'**, then the extension is generated using **'WAN 2.1 14B Image-to-Video 720P'**.\n"
-        "       - Otherwise, the same selected model is used for the extension.\n\n"
+        "   - This last frame is then re-fed to the generation pipeline using almost the same parameters, ensuring consistency.\n\n"
         "4. **Merging Segments:**\n"
-        "   - All generated segments, including the base segment and all extensions, are merged together into one final video using ffmpeg.\n"
-        "   - Each segment is also saved individually (with the last frames stored in the 'used_last_frames' folder) for reference.\n\n"
+        "   - All generated segments, including the base segment and all extensions, are merged together into one final video using ffmpeg.\n\n"
         "5. **Optional Frame-Rate Enhancement:**\n"
-        "   - If the Practical-RIFE option is enabled, the final merged video undergoes frame-rate enhancement (doubling or quadrupling the FPS) for smoother motion.\n\n"
+        "   - If the Practical-RIFE option is enabled, the final merged video undergoes frame-rate enhancement for smoother motion.\n\n"
         "6. **Batch Processing:**\n"
-        "   - When processing a folder of files, a similar extension process is applied. For video files, the last frame is extracted and used to generate additional segments.\n\n"
-        "**User Considerations:**\n"
-        "- **Continuity & Quality:** The extension relies on the last frame, so slight differences may appear between segments. Adjust the slider for a balance between video length and consistency.\n"
-        "- **Resource Usage:** Extra segments use additional GPU/CPU time and memory. Consider lower extension factors if your hardware is constrained.\n"
-        "- **Flexibility:** Experiment with various extend factors to suit narrative or scene extension requirements.\n\n"
-        "By using the 'Extend Video Factor' and clicking this button, you get full insight into what the app does behind the scenes – from basic video generation to dynamic video extension and optional frame rate enhancement."
+        "   - When processing a folder of files, a similar extension process is applied.\n\n"
+        "By clicking this button, you get full insight into what the app does behind the scenes."
     )
     return info
 
-# ------------------------- Pipeline Generation Functions -------------------------
+# ------------------------- Single Generation Pipeline (Improved) -------------------------
+
+def get_next_generation_number(output_folder):
+    import re
+    max_num = 0
+    if os.path.exists(output_folder):
+        for f in os.listdir(output_folder):
+            m = re.match(r'^(\d{4})\.mp4$', f)
+            if m:
+                num = int(m.group(1))
+                if num > max_num:
+                    max_num = num
+    return max_num + 1
 
 def generate_videos(
     prompt, tar_lang, negative_prompt, input_image, input_video, denoising_strength, num_generations,
     save_prompt, multi_line, use_random_seed, seed_input, quality, fps,
     model_choice_radio, vram_preset, num_persistent_input, torch_dtype, num_frames,
-    aspect_ratio, width, height, auto_crop, auto_scale, tiled, inference_steps, pr_rife_enabled, pr_rife_radio, cfg_scale, sigma_shift,
+    aspect_ratio, width, height, auto_crop, auto_scale, tiled,
+    inference_steps, pr_rife_enabled, pr_rife_radio, cfg_scale, sigma_shift,
     enable_teacache, tea_cache_l1_thresh, tea_cache_model_id,
     lora_model, lora_alpha,
     lora_model_2, lora_alpha_2,
-    lora_model_3, lora_alpha_3,
+    lora_model_3, lora_alpha_slider_3,
     lora_model_4, lora_alpha_4,
-    clear_cache_after_gen, extend_factor
+    clear_cache_after_gen, extend_factor,
+    override_input_file=None,
+    output_dir_override="outputs",
+    custom_output_filename=None
 ):
     global loaded_pipeline, loaded_pipeline_config, cancel_flag, prompt_expander
+
+    output_folder = output_dir_override
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+        
+    if input_image is None and input_video is None and override_input_file is not None:
+        ext = os.path.splitext(override_input_file)[1].lower()
+        if ext == ".mp4":
+            input_video = override_input_file
+        else:
+            try:
+                loaded_img = Image.open(override_input_file)
+                loaded_img = ImageOps.exif_transpose(loaded_img)
+                input_image = loaded_img.convert("RGB")
+            except Exception as e:
+                print(f"[CMD] Error loading file {override_input_file}: {e}")
+
     cancel_flag = False
     log_text = ""
     last_used_seed = None
@@ -754,9 +1116,8 @@ def generate_videos(
     if input_image is None and input_video is not None:
         input_was_video = True
         orig_video_path = input_video if isinstance(input_video, str) else input_video.name
-        if extend_factor > 1:
-            copied_input_video = copy_to_outputs(orig_video_path)
-            log_text += f"[CMD] Copied input video to: {copied_input_video}\n"
+        copied_input_video = copy_to_outputs(orig_video_path)
+        log_text += f"[CMD] Copied input video to: {copied_input_video}\n"
 
     if model_choice_radio == "WAN 2.1 1.3B (Text/Video-to-Video)":
         model_choice = "1.3B"
@@ -772,7 +1133,7 @@ def generate_videos(
         d = ASPECT_RATIOS_1_3b
     else:
         return None, "Invalid model choice.", ""
-
+    
     target_width = int(width)
     target_height = int(height)
 
@@ -830,22 +1191,29 @@ def generate_videos(
     if lora_model_2 and lora_model_2 != "None":
         effective_loras.append((os.path.join("LoRAs", lora_model_2), lora_alpha_2))
     if lora_model_3 and lora_model_3 != "None":
-        effective_loras.append((os.path.join("LoRAs", lora_model_3), lora_alpha_3))
+        effective_loras.append((os.path.join("LoRAs", lora_model_3), lora_alpha_slider_3))
     if lora_model_4 and lora_model_4 != "None":
         effective_loras.append((os.path.join("LoRAs", lora_model_4), lora_alpha_4))
         
+    # Define a helper to format LoRA alpha values consistently
+    def format_alpha(alpha):
+        try:
+            return str(float(alpha))
+        except Exception:
+            return str(alpha)
+    
     new_config = {
          "model_choice": model_choice,
          "torch_dtype": torch_dtype,
-         "num_persistent": vram_value,
+         "num_persistent": str(vram_value),
          "lora_model": lora_model,
-         "lora_alpha": lora_alpha,
+         "lora_alpha": format_alpha(lora_alpha) if lora_model != "None" else "None",
          "lora_model_2": lora_model_2,
-         "lora_alpha_2": lora_alpha_2,
+         "lora_alpha_2": format_alpha(lora_alpha_2) if lora_model_2 != "None" else "None",
          "lora_model_3": lora_model_3,
-         "lora_alpha_3": lora_alpha_3,
+         "lora_alpha_3": format_alpha(lora_alpha_slider_3) if lora_model_3 != "None" else "None",
          "lora_model_4": lora_model_4,
-         "lora_alpha_4": lora_alpha_4
+         "lora_alpha_4": format_alpha(lora_alpha_4) if lora_model_4 != "None" else "None",
     }
     loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, new_config)
     if loaded_pipeline is None:
@@ -856,40 +1224,64 @@ def generate_videos(
         prompts_list = [line.strip() for line in prompt.splitlines() if line.strip()]
     else:
         prompts_list = [prompt.strip()]
+        
     total_iterations = len(prompts_list) * int(num_generations)
-    iteration = 0
-    generated_segments = []
-    last_video_path = None
+    if custom_output_filename:
+        base_name_prefix = custom_output_filename
+        counter = 0
+    else:
+        counter = get_next_generation_number(output_folder)
+    
+    if use_random_seed:
+        base_seed = None
+    else:
+        try:
+            base_seed = int(seed_input.strip()) if seed_input.strip() != "" else random.randint(0, 2**32 - 1)
+        except:
+            base_seed = random.randint(0, 2**32 - 1)
+
     for p in prompts_list:
-        for i in range(int(num_generations)):
-            final_prompt = process_random_prompt(p)
+        for gen in range(int(num_generations)):
             if cancel_flag:
-                log_text += "[CMD] Generation cancelled by user.\n"
-                duration = time.time() - overall_start_time
-                log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
-                log_text += f"[CMD] Generation complete. Duration: {duration:.2f} seconds. Last used seed: {last_used_seed}\n"
-                if clear_cache_after_gen:
-                    loaded_pipeline = None
-                    loaded_pipeline_config = {}
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                return final_output_video, log_text, str(last_used_seed or "")
-            iteration += 1
-            gen_start = time.time()
-            log_text += f"[CMD] Generating video {iteration} of {total_iterations} with prompt: {final_prompt}\n"
+                log_text += "[CMD] Generation cancelled by user before starting a new video.\n"
+                return None, log_text, str(last_used_seed or "")
+                
             if use_random_seed:
                 current_seed = random.randint(0, 2**32 - 1)
             else:
-                try:
-                    base_seed = int(seed_input.strip()) if seed_input.strip() != "" else 0
-                    current_seed = base_seed + iteration - 1
-                except:
-                    current_seed = 0
+                current_seed = base_seed + gen if int(num_generations) > 1 else base_seed
             last_used_seed = current_seed
-            print(f"[CMD] Using resolution: width={target_width} height={target_height}")
+
+            if custom_output_filename:
+                base_name = f"{base_name_prefix}{'' if counter == 0 else '_' + str(counter)}"
+                counter += 1
+            else:
+                base_name = f"{counter:04d}"
+                counter += 1
+
+            log_text += f"[CMD] Generation with prompt: {p} and seed: {current_seed}\n"
+
+            base_config = {
+                "model_choice": model_choice,
+                "torch_dtype": torch_dtype,
+                "num_persistent": str(vram_value),
+                "lora_model": lora_model,
+                "lora_alpha": format_alpha(lora_alpha) if lora_model != "None" else "None",
+                "lora_model_2": lora_model_2,
+                "lora_alpha_2": format_alpha(lora_alpha_2) if lora_model_2 != "None" else "None",
+                "lora_model_3": lora_model_3,
+                "lora_alpha_3": format_alpha(lora_alpha_slider_3) if lora_model_3 != "None" else "None",
+                "lora_model_4": lora_model_4,
+                "lora_alpha_4": format_alpha(lora_alpha_4) if lora_model_4 != "None" else "None"
+            }
+            if loaded_pipeline is None or loaded_pipeline_config.get("model_choice") != model_choice:
+                loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, base_config)
+                if loaded_pipeline is None:
+                    loaded_pipeline = load_wan_pipeline(model_choice, torch_dtype, vram_value, lora_path=effective_loras, lora_alpha=None)
+                    loaded_pipeline_config = base_config
+
             common_args = {
-                "prompt": final_prompt,
+                "prompt": process_random_prompt(p),
                 "negative_prompt": negative_prompt,
                 "num_inference_steps": int(inference_steps),
                 "seed": current_seed,
@@ -906,65 +1298,29 @@ def generate_videos(
             else:
                 common_args["tea_cache_l1_thresh"] = None
                 common_args["tea_cache_model_id"] = ""
+            
+            original_filename = os.path.join(output_folder, f"{base_name}.mp4")
+            video_start_time = time.time()
+
             if model_choice == "1.3B":
                 if input_video is not None:
-                    input_video_path = input_video if isinstance(input_video, str) else input_video.name
-                    print(f"[CMD] Processing video-to-video with input video: {input_video_path}")
-                    video_obj = VideoData(input_video_path, height=target_height, width=target_width)
+                    video_obj = VideoData(input_video if isinstance(input_video, str) else input_video.name, height=target_height, width=target_width)
                     video_data = loaded_pipeline(
                         input_video=video_obj,
                         denoising_strength=denoising_strength,
                         **common_args,
                         cancel_fn=lambda: cancel_flag
                     )
-                    if cancel_flag:
-                        log_text += "[CMD] Generation cancelled by user mid-run.\n"
-                        duration = time.time() - overall_start_time
-                        log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
-                        log_text += f"[CMD] Generation complete. Duration: {duration:.2f} seconds. Last used seed: {last_used_seed}\n"
-                        if clear_cache_after_gen:
-                            loaded_pipeline = None
-                            loaded_pipeline_config = {}
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        return final_output_video, log_text, str(last_used_seed or "")
                 else:
                     video_data = loaded_pipeline(
                         **common_args,
                         cancel_fn=lambda: cancel_flag
                     )
-                    if cancel_flag:
-                        log_text += "[CMD] Generation cancelled by user mid-run.\n"
-                        duration = time.time() - overall_start_time
-                        log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
-                        log_text += f"[CMD] Generation complete. Duration: {duration:.2f} seconds. Last used seed: {last_used_seed}\n"
-                        if clear_cache_after_gen:
-                            loaded_pipeline = None
-                            loaded_pipeline_config = {}
-                            gc.collect()
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        return final_output_video, log_text, str(last_used_seed or "")
-                video_filename = get_next_filename(".mp4")
-            elif model_choice == "14B_text":
+            elif model_choice in ["14B_text"]:
                 video_data = loaded_pipeline(
                     **common_args,
                     cancel_fn=lambda: cancel_flag
                 )
-                if cancel_flag:
-                    log_text += "[CMD] Generation cancelled by user mid-run.\n"
-                    duration = time.time() - overall_start_time
-                    log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
-                    log_text += f"[CMD] Generation complete. Duration: {duration:.2f} seconds. Last used seed: {last_used_seed}\n"
-                    if clear_cache_after_gen:
-                        loaded_pipeline = None
-                        loaded_pipeline_config = {}
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    return final_output_video, log_text, str(last_used_seed or "")
-                video_filename = get_next_filename(".mp4")
             elif model_choice in ["14B_image_720p", "14B_image_480p"]:
                 if auto_crop:
                     processed_image = auto_crop_image(original_image, target_width, target_height)
@@ -972,31 +1328,22 @@ def generate_videos(
                     processed_image = auto_scale_image(original_image, target_width, target_height)
                 else:
                     processed_image = original_image
-                video_filename = get_next_filename(".mp4")
-                preprocessed_folder = "auto_pre_processed_images"
-                if not os.path.exists(preprocessed_folder):
-                    os.makedirs(preprocessed_folder)
-                base_name = os.path.splitext(os.path.basename(video_filename))[0]
-                preprocessed_image_filename = os.path.join(preprocessed_folder, f"{base_name}.png")
-                processed_image.save(preprocessed_image_filename)
-                log_text += f"[CMD] Saved auto processed image: {preprocessed_image_filename}\n"
+
+                pre_processed_dir = "auto_pre_processed_images"
+                if not os.path.exists(pre_processed_dir):
+                    os.makedirs(pre_processed_dir)
+                save_filename = os.path.join(pre_processed_dir, f"auto_processed_{int(time.time())}.png")
+                try:
+                    processed_image.save(save_filename)
+                    print(f"[CMD] Auto processed image saved to: {save_filename}")
+                except Exception as e:
+                    print(f"[CMD] Failed to save auto processed image: {e}")
+
                 video_data = loaded_pipeline(
                     input_image=processed_image,
                     **common_args,
                     cancel_fn=lambda: cancel_flag
                 )
-                if cancel_flag:
-                    log_text += "[CMD] Generation cancelled by user mid-run.\n"
-                    duration = time.time() - overall_start_time
-                    log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
-                    log_text += f"[CMD] Generation complete. Duration: {duration:.2f} seconds. Last used seed: {last_used_seed}\n"
-                    if clear_cache_after_gen:
-                        loaded_pipeline = None
-                        loaded_pipeline_config = {}
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    return final_output_video, log_text, str(last_used_seed or "")
             else:
                 err_msg = "[CMD] Invalid combination of inputs."
                 if clear_cache_after_gen:
@@ -1006,171 +1353,304 @@ def generate_videos(
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 return None, err_msg, str(last_used_seed or "")
-            save_video(video_data, video_filename, fps=fps, quality=quality)
-            log_text += f"[CMD] Saved video: {video_filename}\n"
-            final_output_video = video_filename
-            if save_prompt:
-                text_filename = os.path.splitext(video_filename)[0] + ".txt"
-                generation_details = ""
-                generation_details += f"Prompt: {final_prompt}\n"
-                generation_details += f"Negative Prompt: {negative_prompt}\n"
-                generation_details += f"Used Model: {model_choice_radio}\n"
-                generation_details += f"Number of Inference Steps: {inference_steps}\n"
-                generation_details += f"CFG Scale: {cfg_scale}\n"
-                generation_details += f"Sigma Shift: {sigma_shift}\n"
-                generation_details += f"Seed: {current_seed}\n"
-                generation_details += f"Number of Frames: {effective_num_frames}\n"
-                if model_choice == "1.3B" and input_video is not None:
-                    generation_details += f"Denoising Strength: {denoising_strength}\n"
-                else:
-                    generation_details += "Denoising Strength: N/A\n"
-                if effective_loras:
-                    lora_details = ", ".join([f"{os.path.basename(path)} (scale {alpha})" for path, alpha in effective_loras])
-                    generation_details += f"LoRA Models: {lora_details}\n"
-                else:
-                    generation_details += "LoRA Model: None\n"
-                generation_details += f"TeaCache Enabled: {enable_teacache}\n"
-                if enable_teacache:
-                    generation_details += f"TeaCache L1 Threshold: {tea_cache_l1_thresh}\n"
-                    generation_details += f"TeaCache Model ID: {tea_cache_model_id}\n"
-                generation_details += f"Precision: {'FP8' if torch_dtype == 'torch.float8_e4m3fn' else 'BF16'}\n"
-                generation_details += f"Auto Crop: {'Enabled' if auto_crop else 'Disabled'}\n"
-                generation_details += f"Final Resolution: {target_width}x{target_height}\n"
-                generation_duration = time.time() - gen_start
-                generation_details += f"Generation Duration: {generation_duration:.2f} seconds\n"
-                with open(text_filename, "w", encoding="utf-8") as f:
-                    f.write(generation_details)
-                log_text += f"[CMD] Saved prompt and parameters: {text_filename}\n"
-            # Apply Practical-RIFE enhancement for the generated segment if enabled and FPS <= 29.
-            if pr_rife_enabled and video_filename:
-                cap = cv2.VideoCapture(video_filename)
-                source_fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.release()
-                if source_fps <= 29:
-                    print(f"[CMD] Applying Practical-RIFE with multiplier {pr_rife_radio} on video {video_filename}")
-                    multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
-                    improved_video = os.path.join("outputs", "improved_" + os.path.basename(video_filename))
-                    model_dir = os.path.abspath(os.path.join("Practical-RIFE", "train_log"))
-                    cmd = f'"{sys.executable}" "Practical-RIFE/inference_video.py" --model="{model_dir}" --multi={multiplier_val} --video="{video_filename}" --output="{improved_video}"'
-                    subprocess.run(cmd, shell=True, check=True, env=os.environ)
-                    log_text += f"[CMD] Applied Practical-RIFE with multiplier {multiplier_val}x. Improved video saved to {improved_video}\n"
-                    video_filename = improved_video
-                    final_output_video = improved_video
-                else:
-                    log_text += f"[CMD] Skipping Practical-RIFE because source video FPS ({source_fps:.2f}) is above 29.\n"
-            last_video_path = video_filename
-            generated_segments.append(last_video_path)
-            
-    # --- New extend video logic using the same global pipeline ---
-    if extend_factor > 1 and last_video_path:
-        if model_choice_radio == "WAN 2.1 1.3B (Text/Video-to-Video)":
-            ext_model_radio = "WAN 2.1 14B Image-to-Video 480P"
-        elif model_choice_radio == "WAN 2.1 14B Text-to-Video":
-            ext_model_radio = "WAN 2.1 14B Image-to-Video 720P"
-        else:
-            ext_model_radio = model_choice_radio
-        if ext_model_radio == "WAN 2.1 14B Image-to-Video 480P":
-            ext_model_code = "14B_image_480p"
-        elif ext_model_radio == "WAN 2.1 14B Image-to-Video 720P":
-            ext_model_code = "14B_image_720p"
-        else:
-            ext_model_code = model_choice
 
-        if input_was_video and copied_input_video is not None:
-            segments = [copied_input_video]
-            segments.append(last_video_path)
-            log_text += f"[CMD] Starting extension with input video: {copied_input_video}\n"
-            cur_last_video = last_video_path
-        else:
-            segments = [last_video_path]
-            cur_last_video = last_video_path
+            video_duration = time.time() - video_start_time
+            log_text += f"[CMD] Original video generation duration: {video_duration:.2f} seconds\n"
+
+            save_video(video_data, original_filename, fps=fps, quality=quality)
+            log_text += f"[CMD] Saved original video: {original_filename}\n"
+            if save_prompt:
+                txt_filename = os.path.splitext(original_filename)[0] + ".txt"
+                generation_details = generate_prompt_info({
+                    "prompt": p,
+                    "negative_prompt": negative_prompt,
+                    "model_choice": model_choice_radio,
+                    "inference_steps": inference_steps,
+                    "cfg_scale": cfg_scale,
+                    "sigma_shift": sigma_shift,
+                    "seed": current_seed,
+                    "num_frames": effective_num_frames,
+                    "extend_factor": extend_factor,
+                    "num_segments": 1,
+                    "extension_segment": 0,
+                    "total_extensions": int(extend_factor) - 1,
+                    "source_frame": "original",
+                    "input_file": orig_video_path if input_was_video else "",
+                    "is_video": input_was_video,
+                    "has_input_video": input_was_video,
+                    "denoising_strength": denoising_strength,
+                    "is_text_to_video": model_choice == "14B_text",
+                    "lora_details": [f"{os.path.basename(path)} (scale {alpha})" for path, alpha in effective_loras],
+                    "enable_teacache": enable_teacache,
+                    "tea_cache_l1_thresh": tea_cache_l1_thresh,
+                    "tea_cache_model_id": tea_cache_model_id,
+                    "torch_dtype": torch_dtype,
+                    "auto_crop": auto_crop,
+                    "width": target_width,
+                    "height": target_height,
+                    "video_generation_duration": video_duration,
+                    "generation_duration": time.time() - overall_start_time,
+                    "include_minutes": True
+                })
+                with open(txt_filename, "w", encoding="utf-8") as f:
+                    f.write(generation_details)
+                log_text += f"[CMD] Saved prompt info for original video: {txt_filename}\n"
             
-        additional_extensions = int(extend_factor) - (2 if input_was_video else 1)
-        
-        ext_config = {"model_choice": ext_model_code, "torch_dtype": torch_dtype, "num_persistent": vram_value}
-        loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, ext_config)
-        if loaded_pipeline is None:
-            loaded_pipeline = load_wan_pipeline(ext_model_code, torch_dtype, vram_value, lora_path=[], lora_alpha=None)
-            loaded_pipeline_config = ext_config
+            # Only switch the pipeline to extension mode if extend_factor > 1
+            if int(extend_factor) > 1:
+                extension_model_choice = model_choice
+                if model_choice == "1.3B":
+                    extension_model_choice = "14B_image_480p"
+                elif model_choice == "14B_text":
+                    extension_model_choice = "14B_image_720p"
+                if extension_model_choice != model_choice:
+                    log_text += f"[CMD] Switching pipeline for extension segments to model {extension_model_choice}\n"
+                    new_config_ext = new_config.copy()
+                    new_config_ext["model_choice"] = extension_model_choice
+                    loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, new_config_ext)
+                    if loaded_pipeline is None:
+                        loaded_pipeline = load_wan_pipeline(extension_model_choice, torch_dtype, vram_value, lora_path=effective_loras, lora_alpha=None)
+                        loaded_pipeline_config = new_config_ext
+
+            original_improved = None
+            ext_segments = []
+            ext_segments_improved = []
             
-        for ext_iter in range(1, additional_extensions + 1):
-            last_frame = extract_last_frame(cur_last_video)
-            if last_frame is None:
-                log_text += f"[CMD] Failed to extract last frame from {cur_last_video} for extension {ext_iter}.\n"
-                break
-                
-            used_folder = "used_last_frames"
-            if not os.path.exists(used_folder):
-                os.makedirs(used_folder)
-            base_name = os.path.splitext(os.path.basename(cur_last_video))[0]
-            last_frame_filename = os.path.join(used_folder, f"{base_name}_lastframe.png")
-            last_frame.save(last_frame_filename)
-            log_text += f"[CMD] Saved used last frame: {last_frame_filename}\n"
-            
-            new_width, new_height = last_frame.size
-            common_args_ext = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "num_inference_steps": int(inference_steps),
-                "seed": random.randint(0, 2**32 - 1) if use_random_seed else int(seed_input.strip() or 0) + ext_iter,
-                "tiled": tiled,
-                "width": new_width,
-                "height": new_height,
-                "num_frames": int(num_frames),
-                "cfg_scale": cfg_scale,
-                "sigma_shift": sigma_shift,
-            }
-            if enable_teacache:
-                common_args_ext["tea_cache_l1_thresh"] = tea_cache_l1_thresh
-                common_args_ext["tea_cache_model_id"] = tea_cache_model_id
-            else:
-                common_args_ext["tea_cache_l1_thresh"] = None
-                common_args_ext["tea_cache_model_id"] = ""
-                
-            log_text += f"[CMD] Generating extension segment {ext_iter} using model {ext_model_radio}\n"
-            video_filename_ext = get_next_filename(".mp4")
-            video_data_ext = loaded_pipeline(
-                input_image=last_frame,
-                **common_args_ext,
-                cancel_fn=lambda: cancel_flag
-            )
+            additional_extensions = int(extend_factor) - 1
+            prev_video = original_filename
+            for ext_iter in range(1, additional_extensions + 1):
+                if cancel_flag:
+                    log_text += "[CMD] Generation cancelled by user during extensions.\n"
+                    break
+                last_frame = extract_last_frame(prev_video)
+                if last_frame is None:
+                    log_text += f"[CMD] Failed to extract last frame for extension {ext_iter} from {prev_video}.\n"
+                    break
+                used_folder = "used_last_frames"
+                if not os.path.exists(used_folder):
+                    os.makedirs(used_folder)
+                last_frame_filename = os.path.join(used_folder, f"{base_name}_ext{ext_iter}_lastframe.png")
+                last_frame.save(last_frame_filename)
+                log_text += f"[CMD] Saved last frame used for extension {ext_iter}: {last_frame_filename}\n"
+                new_width, new_height = last_frame.size
+                common_args_ext = {
+                    "prompt": process_random_prompt(p),
+                    "negative_prompt": negative_prompt,
+                    "num_inference_steps": int(inference_steps),
+                    "seed": random.randint(0, 2**32 - 1) if use_random_seed else (current_seed),
+                    "tiled": tiled,
+                    "width": new_width,
+                    "height": new_height,
+                    "num_frames": int(num_frames),
+                    "cfg_scale": cfg_scale,
+                    "sigma_shift": sigma_shift,
+                }
+                if enable_teacache:
+                    common_args_ext["tea_cache_l1_thresh"] = tea_cache_l1_thresh
+                    common_args_ext["tea_cache_model_id"] = tea_cache_model_id
+                else:
+                    common_args_ext["tea_cache_l1_thresh"] = None
+                    common_args_ext["tea_cache_model_id"] = ""
+                    
+                extension_filename = os.path.join(output_folder, f"{base_name}_ext{ext_iter}.mp4")
+                log_text += f"[CMD] Generating extension segment {ext_iter} using model {extension_model_choice if int(extend_factor)>1 else model_choice}\n"
+                try:
+                    ext_start_time = time.time()
+                    
+                    video_data_ext = loaded_pipeline(
+                        input_image=last_frame,
+                        **common_args_ext,
+                        cancel_fn=lambda: cancel_flag
+                    )
+                    
+                    ext_duration = time.time() - ext_start_time
+                    log_text += f"[CMD] Extension segment {ext_iter} generation duration: {ext_duration:.2f} seconds\n"
+                    
+                    if not video_data_ext:
+                        log_text += "[CMD] Extension generation returned no data.\n"
+                        break
+                    save_video(video_data_ext, extension_filename, fps=fps, quality=quality)
+                    log_text += f"[CMD] Saved extension segment {ext_iter}: {extension_filename}\n"
+                    if save_prompt:
+                        txt_filename_ext = os.path.splitext(extension_filename)[0] + ".txt"
+                        generation_details_ext = generate_prompt_info({
+                            "prompt": p,
+                            "negative_prompt": negative_prompt,
+                            "model_choice": extension_model_choice if int(extend_factor) > 1 else model_choice_radio,
+                            "extension_model": extension_model_choice if int(extend_factor) > 1 and extension_model_choice != model_choice_radio else None,
+                            "inference_steps": inference_steps,
+                            "cfg_scale": cfg_scale,
+                            "sigma_shift": sigma_shift,
+                            "seed": common_args_ext["seed"],
+                            "num_frames": num_frames,
+                            "extend_factor": extend_factor,
+                            "num_segments": 1,
+                            "extension_segment": ext_iter,
+                            "total_extensions": additional_extensions,
+                            "source_frame": os.path.basename(prev_video),
+                            "input_file": copied_input_video if input_was_video else "",
+                            "is_video": input_was_video,
+                            "has_input_video": input_was_video,
+                            "denoising_strength": denoising_strength,
+                            "is_text_to_video": model_choice=="14B_text",
+                            "lora_details": [f"{os.path.basename(path)} (scale {alpha})" for path, alpha in effective_loras],
+                            "enable_teacache": enable_teacache,
+                            "tea_cache_l1_thresh": tea_cache_l1_thresh,
+                            "tea_cache_model_id": tea_cache_model_id,
+                            "torch_dtype": torch_dtype,
+                            "auto_crop": auto_crop,
+                            "width": new_width,
+                            "height": new_height,
+                            "video_generation_duration": ext_duration,
+                            "generation_duration": time.time() - overall_start_time,
+                            "include_minutes": True
+                        })
+                        with open(txt_filename_ext, "w", encoding="utf-8") as f:
+                            f.write(generation_details_ext)
+                        log_text += f"[CMD] Saved prompt info for extension segment {ext_iter}: {txt_filename_ext}\n"
+                    ext_segments.append(extension_filename)
+                    prev_video = extension_filename
+                except Exception as e:
+                    log_text += f"[CMD] Error during extension generation: {str(e)}\n"
+                    continue
             
             if cancel_flag:
-                log_text += "[CMD] Extension generation cancelled by user mid-run.\n"
-                break
+                log_text += "[CMD] Generation cancelled by user, skipping post-processing steps.\n"
+                if clear_cache_after_gen:
+                    loaded_pipeline = None
+                    loaded_pipeline_config = {}
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                return original_filename, log_text, str(last_used_seed or "")
                 
-            save_video(video_data_ext, video_filename_ext, fps=fps, quality=quality)
-            log_text += f"[CMD] Saved extension segment {ext_iter} video: {video_filename_ext}\n"
-            segments.append(video_filename_ext)
-            cur_last_video = video_filename_ext
-            
-        if len(segments) > 1:
-            try:
-                merged_video = merge_videos(segments)
-                log_text += f"[CMD] Merged extended video saved as: {merged_video}\n"
-                last_video_path = merged_video
-                final_output_video = merged_video
-            except Exception as e:
-                log_text += f"[CMD] Error merging videos: {str(e)}\n"
-                last_video_path = segments[-1]
-                final_output_video = segments[-1]
-        
-        # Apply RIFE on the extended merged video if enabled and FPS <= 29.
-        if pr_rife_enabled and final_output_video:
-            cap = cv2.VideoCapture(final_output_video)
-            source_fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-            if source_fps <= 29:
-                multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
-                improved_video = os.path.join("outputs", "improved_" + os.path.basename(final_output_video))
-                model_dir = os.path.abspath(os.path.join("Practical-RIFE", "train_log"))
-                cmd = f'"{sys.executable}" "Practical-RIFE/inference_video.py" --model="{model_dir}" --multi={multiplier_val} --video="{final_output_video}" --output="{improved_video}"'
-                subprocess.run(cmd, shell=True, check=True, env=os.environ)
-                log_text += f"[CMD] Applied Practical-RIFE to extended video with multiplier {multiplier_val}x. Improved video saved to {improved_video}\n"
-                final_output_video = improved_video
+            if pr_rife_enabled:
+                if cancel_flag:
+                    log_text += "[CMD] Generation cancelled by user before Practical-RIFE processing.\n"
+                else:
+                    original_improved = os.path.join(output_folder, f"{base_name}_improved.mp4")
+                    try:
+                        cap = cv2.VideoCapture(original_filename)
+                        source_fps = cap.get(cv2.CAP_PROP_FPS)
+                        cap.release()
+                        if source_fps <= 29:
+                            print(f"[CMD] Applying Practical-RIFE on original {original_filename}")
+                            multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
+                            cmd = f'"{sys.executable}" "Practical-RIFE/inference_video.py" --model="{os.path.abspath(os.path.join("Practical-RIFE", "train_log"))}" --multi={multiplier_val} --video="{original_filename}" --output="{original_improved}"'
+                            if not cancel_flag:
+                                subprocess.run(cmd, shell=True, check=True, env=os.environ)
+                                log_text += f"[CMD] Applied Practical-RIFE on original. Saved as: {original_improved}\n"
+                            else:
+                                log_text += "[CMD] Generation cancelled by user during Practical-RIFE processing.\n"
+                                original_improved = original_filename
+                        else:
+                            original_improved = original_filename
+                            log_text += f"[CMD] Skipped Practical-RIFE on original because source FPS ({source_fps:.2f}) is above threshold.\n"
+                    except Exception as e:
+                        log_text += f"[CMD] Error applying Practical-RIFE on original: {str(e)}\n"
+                        original_improved = original_filename
+                    
+                    for idx, ext_file in enumerate(ext_segments):
+                        if cancel_flag:
+                            log_text += f"[CMD] Generation cancelled by user before Practical-RIFE processing on extension {idx+1}.\n"
+                            ext_segments_improved.append(ext_file)
+                            continue
+                            
+                        ext_improved = os.path.join(output_folder, f"{base_name}_ext{idx+1}_improved.mp4")
+                        try:
+                            cap = cv2.VideoCapture(ext_file)
+                            source_fps = cap.get(cv2.CAP_PROP_FPS)
+                            cap.release()
+                            if source_fps <= 29:
+                                print(f"[CMD] Applying Practical-RIFE on extension {ext_file}")
+                                multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
+                                cmd = f'"{sys.executable}" "Practical-RIFE/inference_video.py" --model="{os.path.abspath(os.path.join("Practical-RIFE", "train_log"))}" --multi={multiplier_val} --video="{ext_file}" --output="{ext_improved}"'
+                                if not cancel_flag:
+                                    subprocess.run(cmd, shell=True, check=True, env=os.environ)
+                                    log_text += f"[CMD] Applied Practical-RIFE on extension {idx+1}. Saved as: {ext_improved}\n"
+                                else:
+                                    log_text += f"[CMD] Generation cancelled by user during Practical-RIFE processing on extension {idx+1}.\n"
+                                    ext_improved = ext_file
+                            else:
+                                ext_improved = ext_file
+                                log_text += f"[CMD] Skipped Practical-RIFE on extension {idx+1} due to high FPS.\n"
+                        except Exception as e:
+                            log_text += f"[CMD] Error applying Practical-RIFE on extension {idx+1}: {str(e)}\n"
+                            ext_improved = ext_file
+                        ext_segments_improved.append(ext_improved)
             else:
-                log_text += f"[CMD] Skipping Practical-RIFE on extended video because source video FPS ({source_fps:.2f}) is above 29.\n"
+                original_improved = original_filename
+
+            merged_original = None
+            merged_enhanced = None
+            if ext_segments and not cancel_flag:
+                try:
+                    merge_list = [original_filename] + ext_segments
+                    merged_original = os.path.join(output_folder, f"{base_name}_extended_original.mp4")
+                    filelist_path = os.path.join(tempfile.gettempdir(), "filelist_original.txt")
+                    with open(filelist_path, "w", encoding="utf-8") as f:
+                        for vf in merge_list:
+                            if os.path.exists(vf):
+                                f.write(f"file '{os.path.abspath(vf)}'\n")
+                            else:
+                                log_text += f"[CMD] Warning: file not found: {vf}\n"
+                    if os.path.getsize(filelist_path) > 0 and not cancel_flag:
+                        cmd = f'ffmpeg -f concat -safe 0 -i "{filelist_path}" -c copy "{merged_original}"'
+                        subprocess.run(cmd, shell=True, check=True)
+                        os.remove(filelist_path)
+                        log_text += f"[CMD] Merged unenhanced extended video saved as: {merged_original}\n"
+                    else:
+                        if cancel_flag:
+                            log_text += "[CMD] Generation cancelled by user before merging original files.\n"
+                        else:
+                            log_text += f"[CMD] No valid files to merge for extended original.\n"
+                        os.remove(filelist_path)
+                except Exception as e:
+                    log_text += f"[CMD] Error merging original extensions: {str(e)}\n"
+                if pr_rife_enabled and ext_segments_improved and not cancel_flag:
+                    try:
+                        merge_list_improved = [original_improved] + ext_segments_improved
+                        suffix = "_extended_original_enhanced" if len(ext_segments_improved) > 1 else "_extended_enhanced"
+                        merged_enhanced = os.path.join(output_folder, f"{base_name}{suffix}.mp4")
+                        filelist_path = os.path.join(tempfile.gettempdir(), "filelist_enhanced.txt")
+                        with open(filelist_path, "w", encoding="utf-8") as f:
+                            for vf in merge_list_improved:
+                                if os.path.exists(vf):
+                                    f.write(f"file '{os.path.abspath(vf)}'\n")
+                                else:
+                                    log_text += f"[CMD] Warning: file not found: {vf}\n"
+                        if os.path.getsize(filelist_path) > 0 and not cancel_flag:
+                            cmd = f'ffmpeg -f concat -safe 0 -i "{filelist_path}" -c copy "{merged_enhanced}"'
+                            subprocess.run(cmd, shell=True, check=True)
+                            os.remove(filelist_path)
+                            log_text += f"[CMD] Merged enhanced extended video saved as: {merged_enhanced}\n"
+                        else:
+                            if cancel_flag:
+                                log_text += "[CMD] Generation cancelled by user before merging enhanced files.\n"
+                            else:
+                                log_text += f"[CMD] No valid files to merge for extended enhanced video.\n"
+                            os.remove(filelist_path)
+                    except Exception as e:
+                        log_text += f"[CMD] Error merging enhanced extensions: {str(e)}\n"
+
+            if pr_rife_enabled and merged_enhanced and os.path.exists(merged_enhanced):
+                final_output_video = merged_enhanced
+            elif merged_original and os.path.exists(merged_original):
+                final_output_video = merged_original
+            elif original_improved and os.path.exists(original_improved):
+                final_output_video = original_improved
+            else:
+                final_output_video = original_filename
+
+            log_text += f"[CMD] Completed generation for base {base_name}.\n"
             
+            if clear_cache_after_gen:
+                loaded_pipeline = None
+                loaded_pipeline_config = {}
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    
     overall_duration = time.time() - overall_start_time
     log_text += f"\n[CMD] Used VRAM Setting: {vram_value}\n"
     log_text += f"[CMD] Generation complete. Overall Duration: {overall_duration:.2f} seconds ({overall_duration/60:.2f} minutes). Last used seed: {last_used_seed}\n"
@@ -1185,415 +1665,151 @@ def generate_videos(
             
     if final_output_video and os.path.exists(final_output_video):
         return final_output_video, log_text, str(last_used_seed or "")
-    elif last_video_path and os.path.exists(last_video_path):
-        return last_video_path, log_text + "\n[CMD] Warning: Could not generate valid output video.", str(last_used_seed or "")
+    elif final_output_video:
+        return final_output_video, log_text + "\n[CMD] Warning: Could not generate valid output video.", str(last_used_seed or "")
     else:
         return None, log_text + "\n[CMD] Warning: Could not generate valid output video.", str(last_used_seed or "")
 
 def cancel_generation():
-    global cancel_flag
+    global cancel_flag, cancel_batch_flag
     cancel_flag = True
+    cancel_batch_flag = True
     print("[CMD] Cancel button pressed.")
     return "Cancelling generation..."
+
+# ------------------------- Improved Batch Processing -------------------------
 
 def batch_process_videos(
     default_prompt, folder_path, batch_output_folder, skip_overwrite, tar_lang, negative_prompt, denoising_strength,
     use_random_seed, seed_input, quality, fps, model_choice_radio, vram_preset, num_persistent_input,
     torch_dtype, num_frames, inference_steps, aspect_ratio, width, height, auto_crop, auto_scale,
-    tiled, cfg_scale, sigma_shift,
-    save_prompt, pr_rife_enabled, pr_rife_radio, lora_model, lora_alpha,
-    lora_model_2, lora_alpha_2,
-    lora_model_3, lora_alpha_3,
-    lora_model_4, lora_alpha_4,
-    enable_teacache, tea_cache_l1_thresh, tea_cache_model_id,
-    clear_cache_after_gen, extend_factor
+    tiled, cfg_scale, sigma_shift, save_prompt, pr_rife_enabled, pr_rife_radio, lora_model, lora_alpha,
+    lora_model_2, lora_alpha_2, lora_model_3, lora_alpha_3, lora_model_4, lora_alpha_4, enable_teacache,
+    tea_cache_l1_thresh, tea_cache_model_id, clear_cache_after_gen, extend_factor, num_generations
 ):
-    global loaded_pipeline, loaded_pipeline_config, cancel_batch_flag
+    global cancel_batch_flag, cancel_flag
     cancel_batch_flag = False
+    cancel_flag = False
     log_text = ""
-    if model_choice_radio not in ["WAN 2.1 14B Image-to-Video 720P", "WAN 2.1 14B Image-to-Video 480P"]:
-        log_text += f"[CMD] Batch processing currently only supports the WAN 2.1 14B Image-to-Video models.\n"
-        return log_text
-    target_width = int(width)
-    target_height = int(height)
-    num_persistent_input = str(num_persistent_input).replace(",", "")
-    vram_value = int(num_persistent_input)
-    if model_choice_radio == "WAN 2.1 14B Image-to-Video 720P":
-        model_choice = "14B_image_720p"
-    else:
-        model_choice = "14B_image_480p"
-    effective_loras = []
-    if lora_model and lora_model != "None":
-        effective_loras.append((os.path.join("LoRAs", lora_model), lora_alpha))
-    if lora_model_2 and lora_model_2 != "None":
-        effective_loras.append((os.path.join("LoRAs", lora_model_2), lora_alpha_2))
-    if lora_model_3 and lora_model_3 != "None":
-        effective_loras.append((os.path.join("LoRAs", lora_model_3), lora_alpha_3))
-    if lora_model_4 and lora_model_4 != "None":
-        effective_loras.append((os.path.join("LoRAs", lora_model_4), lora_alpha_4))
-    current_config = {
-        "model_choice": model_choice,
-        "torch_dtype": torch_dtype,
-        "num_persistent": vram_value,
-        "lora_model": lora_model,
-        "lora_alpha": lora_alpha,
-        "lora_model_2": lora_model_2,
-        "lora_alpha_2": lora_alpha_2,
-        "lora_model_3": lora_model_3,
-        "lora_alpha_3": lora_alpha_3,
-        "lora_model_4": lora_model_4,
-        "lora_alpha_4": lora_alpha_4
-    }
-    if cancel_batch_flag:
-        log_text += "[CMD] Batch processing cancelled before model loading.\n"
-        cancel_batch_flag = False
-        return log_text
-    loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, current_config)
-    if loaded_pipeline is None:
-        loaded_pipeline = load_wan_pipeline(model_choice, torch_dtype, vram_value, lora_path=effective_loras, lora_alpha=None)
-        loaded_pipeline_config = current_config
-    common_args_base = {
-        "negative_prompt": negative_prompt,
-        "num_inference_steps": int(inference_steps),
-        "tiled": tiled,
-        "width": target_width,
-        "height": target_height,
-        "num_frames": int(num_frames),
-        "cfg_scale": cfg_scale,
-        "sigma_shift": sigma_shift
-    }
     if not os.path.isdir(folder_path):
         log_text += f"[CMD] Provided folder path does not exist: {folder_path}\n"
         return log_text
     if not os.path.exists(batch_output_folder):
-        os.makedirs(batch_output_folder)
-        log_text += f"[CMD] Created batch processing outputs folder: {batch_output_folder}\n"
+        try:
+            os.makedirs(batch_output_folder)
+            log_text += f"[CMD] Created batch processing outputs folder: {batch_output_folder}\n"
+        except Exception as e:
+            log_text += f"[CMD] Error creating output folder {batch_output_folder}: {e}\n"
+            return log_text
     files = os.listdir(folder_path)
-    files = [f for f in files if os.path.splitext(f)[1].lower() in [".jpg", ".png", ".jpeg", ".mp4"]]
+    allowed_exts = [".jpg", ".png", ".jpeg", ".mp4"]
+    files = [f for f in files if os.path.splitext(f)[1].lower() in allowed_exts]
     total_files = len(files)
     log_text += f"[CMD] Found {total_files} files in folder {folder_path}\n"
-    seed_counter = 0
     for file in files:
         if cancel_batch_flag:
             log_text += "[CMD] Batch processing cancelled by user.\n"
-            if clear_cache_after_gen:
-                loaded_pipeline = None
-                loaded_pipeline_config = {}
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            cancel_batch_flag = False
             return log_text
-        iter_start = time.time()
+            
+        file_path = os.path.join(folder_path, file)
         base, ext = os.path.splitext(file)
         prompt_path = os.path.join(folder_path, base + ".txt")
-        if not os.path.exists(prompt_path):
-            log_text += f"[CMD] No prompt txt found for {file}, using user entered prompt: {default_prompt}\n"
-            prompt_content = default_prompt
-        else:
+        if os.path.exists(prompt_path):
             with open(prompt_path, "r", encoding="utf-8") as f:
                 prompt_content = f.read().strip()
             if prompt_content == "":
-                log_text += f"[CMD] Prompt txt {base + '.txt'} is empty, using user entered prompt: {default_prompt}\n"
+                log_text += f"[CMD] Prompt file {base+'.txt'} is empty, using default prompt.\n"
                 prompt_content = default_prompt
             else:
-                log_text += f"[CMD] Using user made prompt txt for {file}: {prompt_content}\n"
-        final_prompt = process_random_prompt(prompt_content)
-        output_filename = os.path.join(batch_output_folder, base + ".mp4")
-        if skip_overwrite and os.path.exists(output_filename):
-            log_text += f"[CMD] Output video {output_filename} already exists, skipping {file}.\n"
-            continue
-        if use_random_seed:
-            current_seed = random.randint(0, 2**32 - 1)
+                log_text += f"[CMD] Using prompt from {base+'.txt'} for {file}\n"
         else:
-            try:
-                base_seed = int(seed_input.strip()) if seed_input.strip() != "" else 0
-                current_seed = base_seed + seed_counter
-                seed_counter += 1
-            except:
-                current_seed = 0
-        common_args = common_args_base.copy()
-        common_args["prompt"] = final_prompt
-        common_args["seed"] = current_seed
-        if enable_teacache:
-            common_args["tea_cache_l1_thresh"] = tea_cache_l1_thresh
-            common_args["tea_cache_model_id"] = tea_cache_model_id
-        else:
-            common_args["tea_cache_l1_thresh"] = None
-            common_args["tea_cache_model_id"] = ""
-        log_text += f"[CMD] Processing {file} with prompt and seed {current_seed}\n"
-        is_input_video = False
-        image_obj = None
-        if ext.lower() == ".mp4":
-            is_input_video = True
-            original_file_path = os.path.join(folder_path, file)
-            image_obj = extract_last_frame(original_file_path)
-            if image_obj is None:
-                log_text += f"[CMD] Failed to extract frame from video {file}\n"
-                continue
-            log_text += f"[CMD] Extracted last frame from video {file} for processing.\n"
-        else:
-            try:
-                image_path = os.path.join(folder_path, file)
-                image_obj = Image.open(image_path)
-                image_obj = ImageOps.exif_transpose(image_obj)
-                image_obj = image_obj.convert("RGB")
-            except Exception as e:
-                log_text += f"[CMD] Failed to open image {file}: {str(e)}\n"
-                continue
-        if auto_crop:
-            processed_image = auto_crop_image(image_obj, target_width, target_height)
-        elif auto_scale:
-            processed_image = auto_scale_image(image_obj, target_width, target_height)
-        else:
-            processed_image = image_obj
+            log_text += f"[CMD] No prompt file for {file}, using default prompt.\n"
+            prompt_content = default_prompt
+            
         if cancel_batch_flag:
-            log_text += "[CMD] Batch processing cancelled by user before pipeline.\n"
-            if clear_cache_after_gen:
-                loaded_pipeline = None
-                loaded_pipeline_config = {}
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            cancel_batch_flag = False
+            log_text += "[CMD] Batch processing cancelled by user.\n"
             return log_text
-        video_data = loaded_pipeline(
-            input_image=processed_image,
-            **common_args,
-            cancel_fn=lambda: cancel_batch_flag
+            
+        ext_lower = ext.lower()
+        if ext_lower == ".mp4":
+            image_in = None
+            video_in = file_path
+        else:
+            try:
+                loaded_img = Image.open(file_path)
+                loaded_img = ImageOps.exif_transpose(loaded_img)
+                image_in = loaded_img.convert("RGB")
+            except Exception as e:
+                log_text += f"[CMD] Error loading image {file_path}: {e}\n"
+                continue
+            video_in = None
+        
+        if cancel_batch_flag:
+            log_text += "[CMD] Batch processing cancelled by user.\n"
+            return log_text
+            
+        custom_filename = base
+
+        print(f"DEBUG processing {file_path}")
+        
+        generated_video, single_log, _ = generate_videos(
+            prompt_content, tar_lang, negative_prompt, image_in, video_in, denoising_strength, num_generations,
+            save_prompt, False, use_random_seed, seed_input, quality, fps,
+            model_choice_radio, vram_preset, num_persistent_input, torch_dtype, num_frames,
+            aspect_ratio, width, height, auto_crop, auto_scale, tiled, inference_steps, pr_rife_enabled, pr_rife_radio, cfg_scale, sigma_shift,
+            enable_teacache, tea_cache_l1_thresh, tea_cache_model_id,
+            lora_model, lora_alpha, lora_model_2, lora_alpha_2, lora_model_3, lora_alpha_3, lora_model_4, lora_alpha_4,
+            clear_cache_after_gen, extend_factor,
+            None,
+            output_dir_override=batch_output_folder,
+            custom_output_filename=custom_filename
         )
-        if not video_data or cancel_batch_flag:
-            log_text += "[CMD] Batch processing cancelled by user mid-run.\n"
-            if clear_cache_after_gen:
-                loaded_pipeline = None
-                loaded_pipeline_config = {}
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            cancel_batch_flag = False
+        log_text += single_log
+        
+        if cancel_batch_flag:
+            log_text += "[CMD] Batch processing cancelled by user after file completion.\n"
             return log_text
-        save_video(video_data, output_filename, fps=fps, quality=quality)
-        log_text += f"[CMD] Saved batch generated video: {output_filename}\n"
-        if auto_crop or auto_scale:
-            preprocessed_folder = "auto_pre_processed_images"
-            if not os.path.exists(preprocessed_folder):
-                os.makedirs(preprocessed_folder)
-            base_name = os.path.splitext(os.path.basename(output_filename))[0]
-            preprocessed_image_filename = os.path.join(preprocessed_folder, f"{base_name}.png")
-            processed_image.save(preprocessed_image_filename)
-            log_text += f"[CMD] Saved auto processed image: {preprocessed_image_filename}\n"
-        generation_duration = time.time() - iter_start
-        if save_prompt:
-            text_filename = os.path.splitext(output_filename)[0] + ".txt"
-            generation_details = ""
-            generation_details += f"Prompt: {final_prompt}\n"
-            generation_details += f"Negative Prompt: {negative_prompt}\n"
-            generation_details += f"Used Model: {model_choice_radio}\n"
-            generation_details += f"Number of Inference Steps: {inference_steps}\n"
-            generation_details += f"CFG Scale: {cfg_scale}\n"
-            generation_details += f"Sigma Shift: {sigma_shift}\n"
-            generation_details += f"Seed: {current_seed}\n"
-            generation_details += f"Number of Frames: {num_frames}\n"
-            generation_details += f"Denoising Strength: {denoising_strength}\n"
-            if effective_loras:
-                lora_details = ", ".join([f"{os.path.basename(path)} (scale {alpha})" for path, alpha in effective_loras])
-                generation_details += f"LoRA Models: {lora_details}\n"
-            else:
-                generation_details += "LoRA Model: None\n"
-            generation_details += f"TeaCache Enabled: {enable_teacache}\n"
-            if enable_teacache:
-                generation_details += f"TeaCache L1 Threshold: {tea_cache_l1_thresh}\n"
-                generation_details += f"TeaCache Model ID: {tea_cache_model_id}\n"
-            generation_details += f"Precision: {'FP8' if torch_dtype == 'torch.float8_e4m3fn' else 'BF16'}\n"
-            generation_details += f"Auto Crop: {'Enabled' if auto_crop else 'Disabled'}\n"
-            generation_details += f"Final Resolution: {target_width}x{target_height}\n"
-            generation_details += f"Generation Duration: {generation_duration:.2f} seconds / {(generation_duration/60):.2f} minutes\n"
-            with open(text_filename, "w", encoding="utf-8") as f:
-                f.write(generation_details)
-            log_text += f"[CMD] Saved prompt and parameters: {text_filename}\n"
-            # Apply Practical-RIFE for batch processed video if enabled and FPS <= 29.
-            if pr_rife_enabled:
-                cap = cv2.VideoCapture(output_filename)
-                source_fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.release()
-                if source_fps <= 29:
-                    multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
-                    improved_video = os.path.join(batch_output_folder, "improved_" + os.path.basename(output_filename))
-                    model_dir = os.path.abspath(os.path.join("Practical-RIFE", "train_log"))
-                    cmd = (
-                        f'"{sys.executable}" "Practical-RIFE/inference_video.py" '
-                        f'--model="{model_dir}" --multi={multiplier_val} '
-                        f'--video="{output_filename}" --output="{improved_video}"'
-                    )
-                    subprocess.run(cmd, shell=True, check=True, env=os.environ)
-                    log_text += f"[CMD] Applied Practical-RIFE with multiplier {multiplier_val}x. Improved video saved to {improved_video}\n"
-                    output_filename = improved_video
-                else:
-                    log_text += f"[CMD] Skipping Practical-RIFE for batch generated video because its FPS ({source_fps:.2f}) is above 29.\n"
-        if extend_factor > 1:
-            if is_input_video:
-                original_file_path = copy_to_outputs(original_file_path)
-                segments = [original_file_path]
-                cur_last_video = original_file_path
-            else:
-                segments = [output_filename]
-                cur_last_video = output_filename
-            if model_choice_radio == "WAN 2.1 1.3B (Text/Video-to-Video)":
-                ext_model_radio = "WAN 2.1 14B Image-to-Video 480P"
-            elif model_choice_radio == "WAN 2.1 14B Text-to-Video":
-                ext_model_radio = "WAN 2.1 14B Image-to-Video 720P"
-            else:
-                ext_model_radio = model_choice_radio
-            if ext_model_radio == "WAN 2.1 14B Image-to-Video 480P":
-                ext_model_code = "14B_image_480p"
-            elif ext_model_radio == "WAN 2.1 14B Image-to-Video 720P":
-                ext_model_code = "14B_image_720p"
-            else:
-                ext_model_code = model_choice
-            for ext_iter in range(1, int(extend_factor)):
-                if ext_iter == 1 and is_input_video:
-                    last_frame = extract_last_frame(original_file_path)
-                else:
-                    last_frame = extract_last_frame(cur_last_video)
-                if last_frame is None:
-                    log_text += "[CMD] Failed to extract last frame for extension.\n"
-                    break
-                used_folder = "used_last_frames"
-                if not os.path.exists(used_folder):
-                    os.makedirs(used_folder)
-                base_name = os.path.splitext(os.path.basename(cur_last_video))[0]
-                last_frame_filename = os.path.join(used_folder, f"{base_name}_lastframe.png")
-                last_frame.save(last_frame_filename)
-                log_text += f"[CMD] Saved used last frame: {last_frame_filename}\n"
-                new_width, new_height = last_frame.size
-                common_args_ext = {
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "num_inference_steps": int(inference_steps),
-                    "seed": random.randint(0, 2**32 - 1) if use_random_seed else int(seed_input.strip() or 0) + ext_iter,
-                    "tiled": tiled,
-                    "width": new_width,
-                    "height": new_height,
-                    "num_frames": int(num_frames),
-                    "cfg_scale": cfg_scale,
-                    "sigma_shift": sigma_shift,
-                }
-                if enable_teacache:
-                    common_args_ext["tea_cache_l1_thresh"] = tea_cache_l1_thresh
-                    common_args_ext["tea_cache_model_id"] = tea_cache_model_id
-                else:
-                    common_args_ext["tea_cache_l1_thresh"] = None
-                    common_args_ext["tea_cache_model_id"] = ""
-                ext_config = {"model_choice": ext_model_code, "torch_dtype": torch_dtype, "num_persistent": vram_value}
-                loaded_pipeline, loaded_pipeline_config = clear_pipeline_if_needed(loaded_pipeline, loaded_pipeline_config, ext_config)
-                if loaded_pipeline is None:
-                    loaded_pipeline = load_wan_pipeline(ext_model_code, torch_dtype, vram_value, lora_path=[], lora_alpha=None)
-                    loaded_pipeline_config = ext_config
-                log_text += f"[CMD] Processing extension for {file} extension iteration {ext_iter}\n"
-                output_filename_ext = os.path.join(batch_output_folder, get_next_filename(".mp4"))
-                video_data_ext = loaded_pipeline(
-                    input_image=last_frame,
-                    **common_args_ext,
-                    cancel_fn=lambda: cancel_batch_flag
-                )
-                if not video_data_ext or cancel_batch_flag:
-                    log_text += "[CMD] Extension generation cancelled by user mid-run.\n"
-                    break
-                save_video(video_data_ext, output_filename_ext, fps=fps, quality=quality)
-                log_text += f"[CMD] Saved extension segment {ext_iter}: {output_filename_ext}\n"
-                segments.append(output_filename_ext)
-                cur_last_video = output_filename_ext
-            if len(segments) > 1:
-                merged_video = merge_videos(segments)
-                log_text += f"[CMD] Merged extended video saved as: {merged_video}\n"
-                output_filename = merged_video
-            if pr_rife_enabled:
-                cap = cv2.VideoCapture(output_filename)
-                source_fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.release()
-                if source_fps <= 29:
-                    multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
-                    improved_video = os.path.join(batch_output_folder, "improved_" + os.path.basename(output_filename))
-                    model_dir = os.path.abspath(os.path.join("Practical-RIFE", "train_log"))
-                    cmd = (
-                        f'"{sys.executable}" "Practical-RIFE/inference_video.py" '
-                        f'--model="{model_dir}" --multi={multiplier_val} '
-                        f'--video="{output_filename}" --output="{improved_video}"'
-                    )
-                    subprocess.run(cmd, shell=True, check=True, env=os.environ)
-                    log_text += f"[CMD] Applied Practical-RIFE with multiplier {multiplier_val}x. Improved video saved to {improved_video}\n"
-                    output_filename = improved_video
-                else:
-                    log_text += f"[CMD] Skipping Practical-RIFE for batch generated video extension because its FPS ({source_fps:.2f}) is above 29.\n"
-        if pr_rife_enabled:
-            cap = cv2.VideoCapture(output_filename)
-            source_fps = cap.get(cv2.CAP_PROP_FPS)
-            cap.release()
-            if source_fps <= 29:
-                multiplier_val = "2" if pr_rife_radio == "2x FPS" else "4"
-                improved_video = os.path.join(batch_output_folder, "improved_" + os.path.basename(output_filename))
-                model_dir = os.path.abspath(os.path.join("Practical-RIFE", "train_log"))
-                cmd = (
-                    f'"{sys.executable}" "Practical-RIFE/inference_video.py" '
-                    f'--model="{model_dir}" --multi={multiplier_val} '
-                    f'--video="{output_filename}" --output="{improved_video}"'
-                )
-                subprocess.run(cmd, shell=True, check=True, env=os.environ)
-                log_text += f"[CMD] Applied Practical-RIFE with multiplier {multiplier_val}x. Improved video saved to {improved_video}\n"
-                output_filename = improved_video
-            else:
-                log_text += f"[CMD] Skipping Practical-RIFE for batch generated video because its FPS ({source_fps:.2f}) is above 29.\n"
-        generation_duration = time.time() - iter_start
-        if save_prompt:
-            text_filename = os.path.splitext(output_filename)[0] + ".txt"
-            generation_details = ""
-            generation_details += f"Prompt: {final_prompt}\n"
-            generation_details += f"Negative Prompt: {negative_prompt}\n"
-            generation_details += f"Used Model: {model_choice_radio}\n"
-            generation_details += f"Number of Inference Steps: {inference_steps}\n"
-            generation_details += f"CFG Scale: {cfg_scale}\n"
-            generation_details += f"Sigma Shift: {sigma_shift}\n"
-            generation_details += f"Seed: {current_seed}\n"
-            generation_details += f"Number of Frames: {num_frames}\n"
-            generation_details += f"Denoising Strength: {denoising_strength}\n"
-            if effective_loras:
-                lora_details = ", ".join([f"{os.path.basename(path)} (scale {alpha})" for path, alpha in effective_loras])
-                generation_details += f"LoRA Models: {lora_details}\n"
-            else:
-                generation_details += "LoRA Model: None\n"
-            generation_details += f"TeaCache Enabled: {enable_teacache}\n"
-            if enable_teacache:
-                generation_details += f"TeaCache L1 Threshold: {tea_cache_l1_thresh}\n"
-                generation_details += f"TeaCache Model ID: {tea_cache_model_id}\n"
-            generation_details += f"Precision: {'FP8' if torch_dtype == 'torch.float8_e4m3fn' else 'BF16'}\n"
-            generation_details += f"Auto Crop: {'Enabled' if auto_crop else 'Disabled'}\n"
-            generation_details += f"Final Resolution: {target_width}x{target_height}\n"
-            generation_details += f"Generation Duration: {generation_duration:.2f} seconds / {(generation_duration/60):.2f} minutes\n"
-            with open(text_filename, "w", encoding="utf-8") as f:
-                f.write(generation_details)
-            log_text += f"[CMD] Saved prompt and parameters: {text_filename}\n"
+            
     return log_text
 
 def cancel_batch_process():
-    global cancel_batch_flag
+    global cancel_batch_flag, cancel_flag
     cancel_batch_flag = True
+    cancel_flag = True
     print("[CMD] Batch process cancel button pressed.")
-    return "Cancelling batch process..."
+    return "Cancelling batch process...", "Cancelling any active generation..."
 
-def get_next_filename(extension):
-    outputs_dir = "outputs"
-    if not os.path.exists(outputs_dir):
-        os.makedirs(outputs_dir)
-    existing_files = [f for f in os.listdir(outputs_dir) if f.endswith(extension)]
-    current_numbers = []
-    for file in existing_files:
-        try:
-            num = int(os.path.splitext(file)[0])
-            current_numbers.append(num)
-        except:
-            continue
-    next_number = max(current_numbers, default=0) + 1
-    return os.path.join(outputs_dir, f"{next_number:05d}{extension}")
+def get_next_filename(extension, output_dir="outputs"):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    if extension.startswith("_"):
+        base_name = extension[1:].split(".")[0]
+        file_ext = "." + extension.split(".")[-1]
+        
+        existing_files = [f for f in os.listdir(output_dir) if base_name in f and f.endswith(file_ext)]
+        current_numbers = []
+        for file in existing_files:
+            try:
+                match = re.search(r'(\d+)_' + re.escape(base_name), file)
+                if match:
+                    current_numbers.append(int(match.group(1)))
+            except:
+                pass
+        
+        if not current_numbers:
+            next_number = 1
+        else:
+            next_number = max(current_numbers) + 1
+        
+        return os.path.join(output_dir, f"{next_number}_{base_name}{file_ext}")
+    else:
+        counter = 1
+        while True:
+            filename = os.path.join(output_dir, f"{counter}{extension}")
+            if not os.path.exists(filename):
+                return filename
+            counter += 1
 
 def open_outputs_folder():
     outputs_dir = os.path.abspath("outputs")
@@ -1604,7 +1820,6 @@ def open_outputs_folder():
     else:
         print("[CMD] Opening folder not supported on this OS.")
     return f"Opened {outputs_dir}"
-
 
 model_manager = ModelManager(device="cpu")
 
@@ -1700,11 +1915,23 @@ def load_wan_pipeline(model_choice, torch_dtype_str, num_persistent, lora_path=N
     if lora_path is not None:
         if isinstance(lora_path, list):
             for path, alpha in lora_path:
-                print(f"[CMD] Loading LoRA from {path} with alpha {alpha}")
-                model_manager.load_lora(path, lora_alpha=alpha)
+                try:
+                    print(f"[CMD] Loading LoRA from {path} with alpha {alpha}")
+                    if os.path.exists(path):
+                        model_manager.load_lora(path, lora_alpha=alpha)
+                    else:
+                        print(f"[CMD] Warning: LoRA file not found: {path}")
+                except Exception as e:
+                    print(f"[CMD] Error loading LoRA {path}: {e}")
         else:
-            print(f"[CMD] Loading LoRA from {lora_path} with alpha {lora_alpha}")
-            model_manager.load_lora(lora_path, lora_alpha=lora_alpha)
+            try:
+                print(f"[CMD] Loading LoRA from {lora_path} with alpha {lora_alpha}")
+                if os.path.exists(lora_path):
+                    model_manager.load_lora(lora_path, lora_alpha=lora_alpha)
+                else:
+                    print(f"[CMD] Warning: LoRA file not found: {lora_path}")
+            except Exception as e:
+                print(f"[CMD] Error loading LoRA {lora_path}: {e}")
     pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device=device)
     try:
         num_persistent_val = int(num_persistent)
@@ -1727,11 +1954,10 @@ def get_lora_choices():
 
 def refresh_lora_list():
     update_val = gr.update(choices=get_lora_choices(), value="None")
-    # Return the same update for all four LoRA dropdowns.
     return update_val, update_val, update_val, update_val
 
 def apply_fast_preset():
-    return 20, True, 0.15, 10
+    return 20, True, 0.15, 5.6
 
 # ------------------------- Main application with Gradio -------------------------
 
@@ -1748,7 +1974,7 @@ if __name__ == "__main__":
     cancel_batch_flag = False
     prompt_expander = None
     with gr.Blocks() as demo:
-        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V47 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
+        gr.Markdown("SECourses Wan 2.1 I2V - V2V - T2V Advanced Gradio APP V57 | Tutorial : https://youtu.be/hnAhveNy-8s | Source : https://www.patreon.com/posts/123105403")
         with gr.Row():
             with gr.Column(scale=4):
                 with gr.Row():
@@ -1756,7 +1982,7 @@ if __name__ == "__main__":
                     cancel_button = gr.Button("Cancel")
                     fast_preset_button = gr.Button("Apply Fast Preset", variant="huggingface")
                     enhance_button = gr.Button("Prompt Enhance", variant="primary")
-                prompt_box = gr.Textbox(label="Prompt (A <random: green , yellow , etc > car) will take random word with trim like : A yellow car", placeholder="Describe the video you want to generate", lines=5)                
+                prompt_box = gr.Textbox(label="Prompt (A <random: green , yellow , etc > car) will take random word with trim like : A yellow car", placeholder="Describe the video you want to generate", lines=5, value=config_loaded.get("prompt", ""))                
                 with gr.Row():
                     gr.Markdown("### Model & Resolution")
                 with gr.Row():
@@ -1777,7 +2003,10 @@ if __name__ == "__main__":
                     )
                 with gr.Row():
                     aspect_ratio_radio = gr.Radio(
-                        choices=list(ASPECT_RATIOS_1_3b.keys()),
+                        # Instead of always using ASPECT_RATIOS_1_3b, determine which set to use based on model choice
+                        choices=list(ASPECT_RATIOS_14b.keys() if 
+                                    config_loaded.get("model_choice") in ["WAN 2.1 14B Text-to-Video", "WAN 2.1 14B Image-to-Video 720P"] 
+                                    else ASPECT_RATIOS_1_3b.keys()),
                         label="Aspect Ratio",
                         value=config_loaded.get("aspect_ratio", "16:9")
                     )
@@ -1800,7 +2029,7 @@ if __name__ == "__main__":
                     with gr.Column():
                         inference_steps_slider = gr.Slider(minimum=1, maximum=100, step=1, value=config_loaded.get("inference_steps", 50), label="Inference Steps")
                 with gr.Row():
-                    quality_slider = gr.Slider(minimum=1, maximum=9, step=1, value=config_loaded.get("quality", 5), label="Quality")
+                    quality_slider = gr.Slider(minimum=1, maximum=10, step=1, value=config_loaded.get("quality", 5), label="Quality")
                     fps_slider = gr.Slider(minimum=8, maximum=30, step=1, value=config_loaded.get("fps", 16), label="FPS (for saving video - you can save as 8 FPS and 4x RIFE to get 2x duration)")
                     num_frames_slider = gr.Slider(minimum=1, maximum=300, step=1, value=config_loaded.get("num_frames", 81), label="Number of Frames (Always 4x+1 e.g. 17 frames = 1 second). More frames uses more VRAM and slower")
                 gr.Markdown("### Increase Video FPS with Practical-RIFE")
@@ -1855,7 +2084,6 @@ if __name__ == "__main__":
                         with gr.Row():
                             save_prompt_checkbox = gr.Checkbox(label="Save prompt to file", value=config_loaded.get("save_prompt", True))
                             multiline_checkbox = gr.Checkbox(label="Multi-line prompt (each line is separate)", value=config_loaded.get("multiline", False))               
-                            
                     with gr.Column():
                         with gr.Row():  
                             use_random_seed_checkbox = gr.Checkbox(label="Use Random Seed", value=config_loaded.get("use_random_seed", True))
@@ -1888,7 +2116,7 @@ if __name__ == "__main__":
                     skip_overwrite_checkbox = gr.Checkbox(label="Skip Overwrite if Output Exists", value=config_loaded.get("skip_overwrite", True))
                     save_prompt_batch_checkbox = gr.Checkbox(label="Save prompt to file (Batch)", value=config_loaded.get("save_prompt_batch", True))
                 with gr.Row():
-                    batch_process_button = gr.Button("Batch Process")
+                    batch_process_button = gr.Button("Batch Process", variant="primary")
                     cancel_batch_process_button = gr.Button("Cancel Batch Process")
                 batch_status_output = gr.Textbox(label="Batch Process Status Log", lines=10)
                 status_output = gr.Textbox(label="Status Log", lines=20)
@@ -1982,11 +2210,12 @@ if __name__ == "__main__":
                 tea_cache_l1_thresh_slider, 
                 tea_cache_model_id_textbox,
                 clear_cache_checkbox,
-                extend_slider
+                extend_slider,
+                num_generations
             ],
             outputs=batch_status_output
         )
-        cancel_batch_process_button.click(fn=cancel_batch_process, outputs=batch_status_output)
+        cancel_batch_process_button.click(fn=cancel_batch_process, outputs=[batch_status_output, status_output])
         load_config_button.click(
             fn=load_config,
             inputs=[config_dropdown],
@@ -2004,7 +2233,8 @@ if __name__ == "__main__":
                 quality_slider, fps_slider, num_frames_slider, denoising_slider, tar_lang,
                 batch_folder_input, batch_output_folder_input, skip_overwrite_checkbox, save_prompt_batch_checkbox,
                 enable_teacache_checkbox, tea_cache_l1_thresh_slider, tea_cache_model_id_textbox,
-                extend_slider
+                extend_slider,
+                prompt_box
             ]
         )
         save_config_button.click(
@@ -2022,9 +2252,27 @@ if __name__ == "__main__":
                 quality_slider, fps_slider, num_frames_slider, denoising_slider, tar_lang,
                 batch_folder_input, batch_output_folder_input, skip_overwrite_checkbox, save_prompt_batch_checkbox,
                 enable_teacache_checkbox, tea_cache_l1_thresh_slider, tea_cache_model_id_textbox,
-                extend_slider
+                extend_slider,
+                prompt_box
             ],
-            outputs=[config_status, config_dropdown]
+            outputs=[
+                config_status, 
+                config_dropdown,
+                model_choice_radio, vram_preset_radio, aspect_ratio_radio, width_slider, height_slider,
+                auto_crop_checkbox, auto_scale_checkbox, tiled_checkbox, inference_steps_slider, pr_rife_checkbox, pr_rife_radio, cfg_scale_slider, sigma_shift_slider,
+                num_persistent_text, torch_dtype_radio,
+                lora_dropdown, lora_alpha_slider,
+                lora_dropdown_2, lora_alpha_slider_2,
+                lora_dropdown_3, lora_alpha_slider_3,
+                lora_dropdown_4, lora_alpha_slider_4,
+                clear_cache_checkbox,
+                negative_prompt, save_prompt_checkbox, multiline_checkbox, num_generations, use_random_seed_checkbox, seed_input,
+                quality_slider, fps_slider, num_frames_slider, denoising_slider, tar_lang,
+                batch_folder_input, batch_output_folder_input, skip_overwrite_checkbox, save_prompt_batch_checkbox,
+                enable_teacache_checkbox, tea_cache_l1_thresh_slider, tea_cache_model_id_textbox,
+                extend_slider,
+                prompt_box
+            ]
         )
         image_input.change(
             fn=update_target_dimensions,
